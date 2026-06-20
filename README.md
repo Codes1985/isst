@@ -5,25 +5,35 @@ sequences. Sequences are reduced to per-segment MinHash signatures, clustered
 hierarchically, assigned stable allele and constellation names, and screened
 for reassortment using a staged statistical pipeline.
 
-## Features
+## How it works
 
-- **MinHash signatures** per segment, hashed with mmh3 (MurmurHash3, pinned
-  x64 128-bit variant). The backend is fixed — there is no fallback — so
-  signatures are reproducible across machines.
-- **Hierarchical clustering** (scipy) with per-segment and per-subtype
-  similarity thresholds.
-- **Stable nomenclature** — an allele name (e.g. `HA.3.0042`) always refers to
-  the same biological allele across re-clustering runs, via centroid-similarity
-  matching rather than ID strings.
-- **Three-stage reassortment detection** — deterministic cross-subtype allele
-  discordance, linkage-disequilibrium testing, and within-cluster distance
-  refinement, with optional permutation validation.
-- **Persistent state** in SQLite, enabling incremental surveillance ingestion
-  against a fixed reference clustering.
-- **Enforced comparability** — the signature parameters that govern whether two
-  signatures can be compared are stamped into the database on first write and
-  validated on every run, so a parameter mismatch fails loudly instead of
-  silently corrupting results (see [Reproducibility note](#reproducibility-note)).
+The pipeline takes a FASTA of influenza whole-genome sequences and moves each
+one through these steps:
+
+1. **Parse & validate** — segments are identified from FASTA headers and
+   length-checked, producing one sequence per genome segment.
+2. **Extract k-mers** — each segment is broken into overlapping k-mers, with
+   `k` chosen per segment (21 for the long segments, down to 17 for the
+   shortest). K-mers containing an ambiguous base (`N`) are dropped, and each is
+   canonicalized — folded to the smaller of itself and its reverse complement —
+   so the result is strand-independent. The unique set of canonical k-mers is
+   what carries forward.
+3. **Signature** — that k-mer set is reduced to a fixed-size MinHash signature (1024),
+   hashed with mmh3 (pinned x64 MurmurHash3), which lets later steps estimate
+   Jaccard similarity.
+4. **Cluster** — signatures are clustered hierarchically (scipy), using
+   per-segment and per-subtype similarity thresholds.
+5. **Allele and Constellation Naming** — each segment gets a stable allele name (e.g. `HA.3.0042`) and the
+   genome gets a whole-genome constellation; names persist across re-clustering
+   via centroid matching.
+6. **Detect reassortment** — a three-stage screen flags cross-subtype (e.g., H3N2 and H1N1) allele
+   discordance, then linkage-disequilibrium departures, then within-cluster
+   distance outliers, with optional permutation validation.
+7. **Persist** — sequences, signatures, and genotypes are stored in SQLite,
+   supporting incremental ingestion of new sequences against a fixed reference
+   clustering. The signature parameters are stamped on first write and validated
+   every run, so a mismatch fails loudly rather than silently corrupting results
+   (see [Reproducibility note](#reproducibility-note)).
 
 ## Installation
 
