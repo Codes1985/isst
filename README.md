@@ -7,8 +7,9 @@ for reassortment using a staged statistical pipeline.
 
 ## Features
 
-- **MinHash signatures** per segment with auto-selected hash backend
-  (`mmh3` > `xxhash` > `hashlib` fallback).
+- **MinHash signatures** per segment, hashed with mmh3 (MurmurHash3, pinned
+  x64 128-bit variant). The backend is fixed — there is no fallback — so
+  signatures are reproducible across machines.
 - **Hierarchical clustering** (scipy) with per-segment and per-subtype
   similarity thresholds.
 - **Stable nomenclature** — an allele name (e.g. `HA.3.0042`) always refers to
@@ -19,6 +20,10 @@ for reassortment using a staged statistical pipeline.
   refinement, with optional permutation validation.
 - **Persistent state** in SQLite, enabling incremental surveillance ingestion
   against a fixed reference clustering.
+- **Enforced comparability** — the signature parameters that govern whether two
+  signatures can be compared are stamped into the database on first write and
+  validated on every run, so a parameter mismatch fails loudly instead of
+  silently corrupting results (see [Reproducibility note](#reproducibility-note)).
 
 ## Installation
 
@@ -124,11 +129,11 @@ also pin exact dependency versions (e.g. a `requirements.txt` lockfile or
 ## Architecture
 
 ```
-run_genotyper.py            CLI entry point (argparse, all file I/O)
 influenza_genotyper/
-├── settings.py             Configuration dataclasses (single source of truth)
-├── config.py               Re-export shim over settings
-├── pipeline.py             GenotypingPipeline — end-to-end orchestration
+├── cli.py                 CLI entry point (argparse, all file I/O)
+├── settings.py            Configuration dataclasses (single source of truth)
+├── config.py              Re-export shim over settings
+├── pipeline.py            GenotypingPipeline — end-to-end orchestration
 └── core/
     ├── sequence_processor.py   FASTA parsing, validation, segment ID
     ├── kmer_extractor.py       K-mer extraction + MinHash signatures
@@ -139,6 +144,7 @@ influenza_genotyper/
     └── database_manager.py     SQLite schema + CRUD
 ```
 
+The `run-genotyper` console command maps to `influenza_genotyper.cli:main`.
 Dependency direction runs strictly downward: the CLI depends on the pipeline,
 the pipeline on the core engines, and the engines on config.
 
