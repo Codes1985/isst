@@ -104,8 +104,9 @@ def _add_run_parser(sub):
     p.add_argument("--no-tsv", action="store_true", default=False,
         help="Skip writing TSV output files. Summary is still printed to stdout.")
 
-    p.add_argument("--num-hashes", metavar="N", type=int, default=256,
-        help="MinHash signature size. Must be identical across all compared runs. (default: 256)")
+    p.add_argument("--num-hashes", metavar="N", type=int, default=None,
+        help="MinHash signature size. Must be identical across all compared runs. "
+             "When omitted, the KmerConfig default is used. (default: 1024)")
 
     p.add_argument("--hash-seed", metavar="SEED", type=int, default=42,
         help="MinHash base seed. Must be identical across all compared runs. (default: 42)")
@@ -380,8 +381,15 @@ def cmd_run(args, log) -> int:
                   "Ensure the package is installed or PYTHONPATH is set correctly.")
         return 1
 
+    # num_hashes is intentionally NOT passed as a hardcoded CLI default. When
+    # the user omits --num-hashes, KmerConfig's own default (the single source
+    # of truth in settings.py) governs, so the CLI and library can never drift.
+    kmer_config = KmerConfig(hash_seed=args.hash_seed)
+    if args.num_hashes is not None:
+        kmer_config.num_hashes = args.num_hashes
+
     config = GenotyperConfig(
-        kmer=KmerConfig(num_hashes=args.num_hashes, hash_seed=args.hash_seed),
+        kmer=kmer_config,
         clustering=ClusteringConfig(
             min_cluster_size=args.min_cluster_size,
             linkage_method=args.linkage,
