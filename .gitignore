@@ -1,0 +1,45 @@
+# ── Project data & outputs ───────────────────────────────────────────────────
+# The genotyper writes a SQLite DB and TSV/JSON results; these are run artifacts,
+# not source. Keep them out of version control.
+data/
+*.db
+*.sqlite
+*.sqlite3
+*_genotypes.tsv
+*_clusters.tsv
+*_orphans.tsv
+*_reassortment.tsv
+*_validation.tsv
+*_summary.json
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+*.egg
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Testing & coverage ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.ruff_cache/
+
+# ── Editors / OS ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

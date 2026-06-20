@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install with the fast-hash backends so CI exercises the same
+          # code path as production; drop "fast-hash" to test the hashlib fallback.
+          pip install -e ".[dev,fast-hash]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Run tests
+        run: pytest --cov=influenza_genotyper --cov-report=term-missing

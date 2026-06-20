@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "influenza-genotyper"
+version = "0.1.0"
+description = "K-mer based genotyping and reassortment detection for influenza whole-genome sequences."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "TODO: your name", email = "todo@example.com" },
+]
+keywords = ["influenza", "genotyping", "reassortment", "minhash", "bioinformatics"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Operating System :: OS Independent",
+]
+
+# Hard runtime dependencies. Lower bounds only — see the note in README about
+# pinning exact versions for reproducible scientific runs.
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+]
+
+[project.optional-dependencies]
+# Faster MinHash backends. The code auto-detects these and falls back to
+# hashlib (SHA-256) when neither is installed, so they are strictly optional.
+fast-hash = [
+    "mmh3>=3.0",
+    "xxhash>=2.0",
+]
+# Development / CI tooling.
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/Codes1985/isst"
+Repository = "https://github.com/Codes1985/isst"
+
+# ── Console entry point ──────────────────────────────────────────────────────
+# ASSUMPTION: run_genotyper.py is a top-level module at the repo root with a
+# main() function. If it lives inside the package, change this to e.g.
+# "influenza_genotyper.run_genotyper:main"; if under tools/, move it onto the
+# import path or convert it to a package module first.
+[project.scripts]
+run-genotyper = "run_genotyper:main"
+
+[tool.setuptools]
+# Top-level run_genotyper.py is shipped as a module alongside the package.
+py-modules = ["run_genotyper"]
+
+[tool.setuptools.packages.find]
+include = ["influenza_genotyper*"]
+exclude = ["tests*", "tools*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# Start lenient; tighten as the codebase settles.
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # line length handled by formatter, not enforced as errors
