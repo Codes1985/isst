@@ -27,16 +27,36 @@ Requires Python 3.9+.
 ```bash
 git clone https://github.com/Codes1985/isst.git
 cd isst
+```
+
+Then install with either pip or conda.
+
+**pip:**
+
+```bash
 pip install -e .
 ```
 
-`mmh3` is a required dependency — it is the single pinned hash backend (there
-is intentionally no fallback, since a different hash function would silently
-produce incomparable signatures). For development:
+**conda** (recommended on systems where building the compiled dependencies is
+awkward — conda supplies numpy, scipy, and mmh3 as prebuilt binaries):
+
+```bash
+conda env create -f environment.yml
+conda activate isst
+```
+
+`mmh3` is a required dependency either way — it is the single pinned hash
+backend (there is intentionally no fallback, since a different hash function
+would silently produce incomparable signatures).
+
+For development, install the `dev` extra (pytest, pytest-cov, ruff):
 
 ```bash
 pip install -e ".[dev]"
 ```
+
+The conda environment installs the `dev` extra by default, so no extra step is
+needed there.
 
 ## Quickstart
 

@@ -1,0 +1,30 @@
+# Conda environment for the influenza genotyper.
+#
+# Creates an env with prebuilt binaries for the compiled scientific deps
+# (numpy / scipy / mmh3) from conda-forge, then pip-installs the package itself
+# in editable mode with its dev extra. The package metadata and entry point
+# still come from pyproject.toml — conda only provides the interpreter and the
+# compiled libraries.
+#
+#   conda env create -f environment.yml
+#   conda activate isst
+#
+# NOTE: the runtime versions below intentionally mirror pyproject.toml. Keep the
+# two in sync when bumping a dependency, or the environments can drift.
+
+name: isst
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python>=3.9
+  - numpy>=1.21
+  - scipy>=1.7
+  - mmh3>=4.0
+  - pip
+  - pip:
+      # Installs the package + dev tools (pytest, pytest-cov, ruff) from the
+      # [dev] extra in pyproject.toml. numpy/scipy/mmh3 are already satisfied
+      # by conda above, so pip only adds the package and the dev dependencies.
+      - -e .[dev]

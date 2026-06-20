@@ -47,16 +47,11 @@ Homepage = "https://github.com/Codes1985/isst"
 Repository = "https://github.com/Codes1985/isst"
 
 # ── Console entry point ──────────────────────────────────────────────────────
-# ASSUMPTION: run_genotyper.py is a top-level module at the repo root with a
-# main() function. If it lives inside the package, change this to e.g.
-# "influenza_genotyper.run_genotyper:main"; if under tools/, move it onto the
-# import path or convert it to a package module first.
+# The CLI lives inside the package at influenza_genotyper/cli.py, so the entry
+# point resolves the same way the package itself does — no loose top-level
+# module, no dependence on where a script sits in the repo.
 [project.scripts]
-run-genotyper = "run_genotyper:main"
-
-[tool.setuptools]
-# Top-level run_genotyper.py is shipped as a module alongside the package.
-py-modules = ["run_genotyper"]
+run-genotyper = "influenza_genotyper.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["influenza_genotyper*"]
