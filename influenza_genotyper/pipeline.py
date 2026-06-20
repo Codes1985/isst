@@ -55,8 +55,18 @@ class GenotypingPipeline:
             clustering_config=self.config.clustering,
         )
 
-    def initialize(self) -> None:
+    def initialize(self, allow_param_change: bool = False) -> None:
+        # Fail fast if the hash backend ever drifts from the pinned golden vector.
+        from .core.kmer_extractor import selftest
+        selftest()
+
         self.db.initialize()
+        # Stamp (fresh DB) or validate (existing DB) the signature parameters.
+        # On mismatch this raises before any signatures are written, rather than
+        # silently producing incomparable data.
+        self.db.ensure_signature_fingerprint(
+            self.config.kmer.signature_fingerprint(), allow_change=allow_param_change
+        )
         self.nomenclature.load_from_db()
         logger.info("Pipeline initialized")
 
@@ -155,12 +165,9 @@ class GenotypingPipeline:
         # This allows NomenclatureManager Stage 2 to match new cluster IDs to
         # existing allele names by centroid similarity rather than by ID string.
         centroid_sig_map: Dict[str, Dict[str, MinHashSignature]] = {}
-        # Parallel map of per-cluster basin radius (data-derived novelty margin).
-        cluster_radius_map: Dict[str, Dict[str, float]] = {}
         if all_cluster_defs is not None:
             # Build lookup: (subtype, segment, cluster_id) -> centroid signature
             centroid_lookup: Dict[Tuple[str, str, str], MinHashSignature] = {}
-            radius_lookup: Dict[Tuple[str, str, str], float] = {}
             for st, seg_results in all_cluster_defs.items():
                 for seg, cluster_list in seg_results.items():
                     for cdef in cluster_list:
@@ -168,28 +175,21 @@ class GenotypingPipeline:
                             centroid_lookup[(st, seg, cdef.cluster_id)] = (
                                 cdef.centroid_signature
                             )
-                            radius_lookup[(st, seg, cdef.cluster_id)] = (
-                                getattr(cdef, "radius", 0.0)
-                            )
 
             for rec in records:
                 st = rec.subtype
                 seq_sigs: Dict[str, MinHashSignature] = {}
-                seq_radii: Dict[str, float] = {}
                 for seg, a in all_assignments.get(rec.sequence_id, {}).items():
                     if not a.is_orphan and a.cluster_id:
                         sig = centroid_lookup.get((st, seg, a.cluster_id))
                         if sig is not None:
                             seq_sigs[seg] = sig
-                            seq_radii[seg] = radius_lookup.get((st, seg, a.cluster_id), 0.0)
                 if seq_sigs:
                     centroid_sig_map[rec.sequence_id] = seq_sigs
-                    cluster_radius_map[rec.sequence_id] = seq_radii
 
         naming_results = self.nomenclature.name_genotypes_batch(
             cluster_id_map, subtype_map, cluster_version,
             all_centroid_signatures=centroid_sig_map if centroid_sig_map else None,
-            all_cluster_radii=cluster_radius_map if cluster_radius_map else None,
         )
 
         available_map = {
@@ -414,7 +414,6 @@ class GenotypingPipeline:
                             conn, cdef.cluster_id, seg, st,
                             cdef.centroid_signature.to_bytes() if cdef.centroid_signature else b"",
                             cdef.size, cdef.mean_diameter, cluster_version,
-                            radius=getattr(cdef, "radius", 0.0),
                         )
                     for a in cr.assignments:
                         if not a.is_orphan:

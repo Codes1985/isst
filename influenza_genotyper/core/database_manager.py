@@ -15,7 +15,36 @@ from ..config import DatabaseConfig, SEGMENTS
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 4
+# v4: signature fingerprint stored in schema_info and enforced on every run.
+#     No table changes — the fingerprint lives in the existing key/value
+#     schema_info table — so there is nothing to migrate for an existing v3 DB
+#     beyond the version stamp. The fingerprint itself is stamped lazily by the
+#     pipeline on first write via ensure_signature_fingerprint().
+
+
+class SignatureFingerprintMismatch(ValueError):
+    """Raised when a run's signature parameters differ from the database's.
+
+    MinHash signatures are only comparable when built with identical
+    parameters.  This database was stamped with one fingerprint on first write;
+    any later run must match it, or every comparison against existing
+    signatures is silently meaningless.  Re-extract under the original
+    parameters, point at a fresh database, or pass an explicit override to
+    deliberately re-stamp (which abandons comparability with existing data).
+    """
+
+    def __init__(self, stored: Dict[str, Any], incoming: Dict[str, Any], diffs: str):
+        self.stored = stored
+        self.incoming = incoming
+        self.diffs = diffs
+        super().__init__(
+            "Signature parameter mismatch with the existing database.\n"
+            f"  Differences (database → this run): {diffs}\n"
+            "  Signatures built now would not be comparable to those already "
+            "stored. Use the original parameters, a fresh --db path, or an "
+            "explicit override to re-stamp."
+        )
 
 CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -70,7 +99,6 @@ CREATE TABLE IF NOT EXISTS clusters (
     centroid_signature BLOB,
     member_count    INTEGER DEFAULT 0,
     mean_diameter   REAL,
-    radius          REAL DEFAULT 0.0,
     version         TEXT NOT NULL,
     is_active       INTEGER DEFAULT 1,
     created_at      TEXT NOT NULL,
@@ -90,8 +118,6 @@ CREATE TABLE IF NOT EXISTS allele_registry (
     first_seen          TEXT NOT NULL,
     last_seen           TEXT NOT NULL,
     is_active           INTEGER DEFAULT 1,
-    provisional         INTEGER DEFAULT 0,
-    radius              REAL DEFAULT 0.0,
     UNIQUE(segment_name, subtype_num, internal_cluster_id)
 );
 
@@ -213,45 +239,77 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_allele_lineage_b ON allele_lineage(allele_b);
             """)
             logger.info("Database migrated to schema v3 (allele_lineage)")
-        if existing < 4:
-            # Orphan-founded ("provisional") allele flag.  Guarded because a
-            # freshly-created DB already has the column from CREATE_TABLES_SQL
-            # while reporting existing=1 (schema_info is written after migrate).
-            if not self._column_exists(conn, "allele_registry", "provisional"):
+
+    # ------------------------------------------------------------------
+    # Signature fingerprint — comparability guard
+    # ------------------------------------------------------------------
+
+    def get_signature_fingerprint(self) -> Optional[Dict[str, Any]]:
+        """Return the stored signature fingerprint, or None if unstamped."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM schema_info WHERE key='signature_fingerprint'"
+            ).fetchone()
+        return json.loads(row["value"]) if row else None
+
+    def ensure_signature_fingerprint(
+        self, fingerprint: Dict[str, Any], allow_change: bool = False
+    ) -> None:
+        """Stamp the database's signature fingerprint, or validate against it.
+
+        On a fresh database the fingerprint is recorded. On every subsequent
+        run the incoming fingerprint must match the stored one exactly, or a
+        SignatureFingerprintMismatch is raised — turning a silent
+        incompatibility into a clear, immediate error before any signatures are
+        written. ``allow_change=True`` re-stamps instead of raising, for
+        deliberate parameter migrations (which abandon comparability with
+        existing data).
+        """
+        incoming = json.dumps(fingerprint, sort_keys=True)
+        stored = self.get_signature_fingerprint()
+        now = datetime.utcnow().isoformat()
+
+        if stored is None:
+            with self.connection() as conn:
                 conn.execute(
-                    "ALTER TABLE allele_registry ADD COLUMN provisional INTEGER DEFAULT 0"
+                    "INSERT OR REPLACE INTO schema_info (key, value, updated_at) "
+                    "VALUES (?, ?, ?)",
+                    ("signature_fingerprint", incoming, now),
                 )
-                logger.info(
-                    "Database migrated to schema v4 (allele_registry.provisional)"
-                )
-        if existing < 5:
-            # Per-lineage observed radius (distance spread) for nearest-lineage
-            # assignment.  Guarded for fresh DBs that already have the column.
-            if not self._column_exists(conn, "allele_registry", "radius"):
+            logger.info("Stamped signature fingerprint: %s", incoming)
+            return
+
+        if json.dumps(stored, sort_keys=True) == incoming:
+            logger.debug("Signature fingerprint matches the database.")
+            return
+
+        diffs = self._diff_fingerprints(stored, fingerprint)
+        if allow_change:
+            with self.connection() as conn:
                 conn.execute(
-                    "ALTER TABLE allele_registry ADD COLUMN radius REAL DEFAULT 0.0"
+                    "INSERT OR REPLACE INTO schema_info (key, value, updated_at) "
+                    "VALUES (?, ?, ?)",
+                    ("signature_fingerprint", incoming, now),
                 )
-                logger.info(
-                    "Database migrated to schema v5 (allele_registry.radius)"
-                )
-        if existing < 6:
-            # Radius as first-class cluster geometry, next to mean_diameter:
-            # written once at cluster formation, recomputed only at recluster,
-            # never mutated during incremental assignment.
-            if not self._column_exists(conn, "clusters", "radius"):
-                conn.execute(
-                    "ALTER TABLE clusters ADD COLUMN radius REAL DEFAULT 0.0"
-                )
-                logger.info(
-                    "Database migrated to schema v6 (clusters.radius)"
-                )
+            logger.warning(
+                "Signature fingerprint CHANGED with allow_change=True (%s). "
+                "Signatures already in this database are NOT comparable to new "
+                "ones.", diffs,
+            )
+            return
+
+        raise SignatureFingerprintMismatch(stored, fingerprint, diffs)
 
     @staticmethod
-    def _column_exists(conn: Any, table: str, column: str) -> bool:
-        return any(
-            row["name"] == column
-            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-        )
+    def _diff_fingerprints(stored: Dict[str, Any], incoming: Dict[str, Any]) -> str:
+        """Human-readable summary of which fingerprint fields differ."""
+        keys = sorted(set(stored) | set(incoming))
+        parts = [
+            f"{k}: {stored.get(k)!r} → {incoming.get(k)!r}"
+            for k in keys
+            if stored.get(k) != incoming.get(k)
+        ]
+        return "; ".join(parts) if parts else "(values differ)"
 
     @contextmanager
     def connection(self):
@@ -428,34 +486,30 @@ class DatabaseManager:
 
     def insert_cluster(self, cluster_id: str, segment_name: str, subtype: str,
                        centroid_signature: bytes, member_count: int,
-                       mean_diameter: float, version: str,
-                       radius: float = 0.0) -> None:
+                       mean_diameter: float, version: str) -> None:
         now = datetime.utcnow().isoformat()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO clusters
                    (cluster_id, segment_name, subtype, centroid_signature,
-                    member_count, mean_diameter, radius, version,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    member_count, mean_diameter, version, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (cluster_id, segment_name, subtype, centroid_signature,
-                 member_count, mean_diameter, float(radius), version, now, now),
+                 member_count, mean_diameter, version, now, now),
             )
 
     def insert_cluster_conn(self, conn: Any, cluster_id: str, segment_name: str,
                             subtype: str, centroid_signature: bytes, member_count: int,
-                            mean_diameter: float, version: str,
-                            radius: float = 0.0) -> None:
+                            mean_diameter: float, version: str) -> None:
         """Bulk-operation variant — uses a caller-supplied connection."""
         now = datetime.utcnow().isoformat()
         conn.execute(
             """INSERT OR REPLACE INTO clusters
                (cluster_id, segment_name, subtype, centroid_signature,
-                member_count, mean_diameter, radius, version,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                member_count, mean_diameter, version, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (cluster_id, segment_name, subtype, centroid_signature,
-             member_count, mean_diameter, float(radius), version, now, now),
+             member_count, mean_diameter, version, now, now),
         )
 
     def get_active_clusters(self, segment_name: str, subtype: str) -> List[Dict]:
@@ -538,29 +592,18 @@ class DatabaseManager:
                       allele_num: int, internal_cluster_id: str,
                       cluster_version: Optional[str] = None,
                       centroid_signature: Optional[bytes] = None,
-                      member_count: int = 0,
-                      provisional: bool = False,
-                      radius: float = 0.0) -> None:
+                      member_count: int = 0) -> None:
         now = datetime.utcnow().isoformat()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO allele_registry
                    (allele_name, segment_name, subtype_num, allele_num,
                     internal_cluster_id, cluster_version, centroid_signature,
-                    member_count, first_seen, last_seen, provisional, radius)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    member_count, first_seen, last_seen)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (allele_name, segment_name, subtype_num, allele_num,
                  internal_cluster_id, cluster_version, centroid_signature,
-                 member_count, now, now, int(provisional), float(radius)),
-            )
-
-    def update_allele_provisional(self, allele_name: str, provisional: bool) -> None:
-        """Set/clear the provisional flag for an allele (e.g. promote an
-        orphan founder to established once a clustered assignment reuses it)."""
-        with self.connection() as conn:
-            conn.execute(
-                "UPDATE allele_registry SET provisional=? WHERE allele_name=?",
-                (int(provisional), allele_name),
+                 member_count, now, now),
             )
 
     def get_allele(self, segment_name: str, subtype_num: int,

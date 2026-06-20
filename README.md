@@ -27,14 +27,15 @@ Requires Python 3.9+.
 ```bash
 git clone https://github.com/Codes1985/isst.git
 cd isst
-pip install -e ".[fast-hash]"     # fast-hash pulls in mmh3 + xxhash
+pip install -e .
 ```
 
-The `fast-hash` extra is optional — without it the tool falls back to a
-SHA-256 backend (correct, just slower). For development:
+`mmh3` is a required dependency — it is the single pinned hash backend (there
+is intentionally no fallback, since a different hash function would silently
+produce incomparable signatures). For development:
 
 ```bash
-pip install -e ".[dev,fast-hash]"
+pip install -e ".[dev]"
 ```
 
 ## Quickstart
@@ -83,15 +84,22 @@ run-genotyper repair \
 
 ## Reproducibility note
 
-MinHash signatures are only comparable when built with identical parameters.
-`--num-hashes`, `--hash-seed`, and the per-segment `k` values **must match
-across every run that shares a database** — mismatched signatures are not
-comparable and will raise at comparison time. Use one database per parameter
-set, and keep the same flags across batch and incremental runs.
+MinHash signatures are only comparable when built with identical parameters:
+`num_hashes`, `hash_seed`, per-segment `k`, the `canonical` flag, and the hash
+backend. The first run against a database **stamps these into a signature
+fingerprint**; every later run validates against it and refuses to proceed on
+any mismatch, with a message naming the offending parameter. This turns a
+silent incompatibility into a clear error before any data is written.
 
-For publication-grade reproducibility, pin exact dependency versions (e.g. with
-a `requirements.txt` lockfile or `pip freeze`) rather than relying on the lower
-bounds declared in `pyproject.toml`.
+The hash backend is pinned to `mmh3` (MurmurHash3, x64 128-bit variant) with no
+fallback, and a startup self-test checks it against a known vector, so a backend
+or library-version change can't quietly alter signatures either.
+
+To deliberately change a parameter you must re-stamp the database (an explicit
+override that abandons comparability with existing signatures) — which on a
+populated database means re-extracting it. For publication-grade reproducibility,
+also pin exact dependency versions (e.g. a `requirements.txt` lockfile or
+`pip freeze`) rather than relying on the lower bounds in `pyproject.toml`.
 
 ## Architecture
 
@@ -117,7 +125,7 @@ the pipeline on the core engines, and the engines on config.
 ## Development
 
 ```bash
-pip install -e ".[dev,fast-hash]"
+pip install -e ".[dev]"
 pytest                 # run the test suite
 ruff check .           # lint
 ```

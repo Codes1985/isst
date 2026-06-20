@@ -40,8 +40,36 @@ class KmerConfig:
     hash_seed: int = 42
     canonical: bool = True
 
+    hash_backend: str = "mmh3"
+    """Hash backend used to build MinHash signatures.
+
+    Pinned to ``mmh3`` (MurmurHash3, x64 128-bit variant).  This is a
+    *comparability* parameter, not just a performance one: signatures built
+    with a different hash function are NOT comparable even at identical
+    num_hashes / hash_seed / k.  It is recorded in the database signature
+    fingerprint and validated on every run.  mmh3 is a hard install
+    requirement; there is no silent fallback.
+    """
+
     def get_k(self, segment: str) -> int:
         return self.segment_k.get(segment, self.default_k)
+
+    def signature_fingerprint(self) -> Dict[str, object]:
+        """Parameters that determine MinHash signature comparability.
+
+        Two signatures are comparable iff they were built with identical values
+        here. This is the single source of truth for the fingerprint recorded
+        in the database on first write and validated on every run.
+        ``hash_backend`` is included even though it is pinned to mmh3, so a
+        future change is caught rather than silently assumed safe.
+        """
+        return {
+            "num_hashes": self.num_hashes,
+            "hash_seed": self.hash_seed,
+            "canonical": self.canonical,
+            "hash_backend": self.hash_backend,
+            "segment_k": {seg: self.get_k(seg) for seg in SEGMENTS},
+        }
 
 
 @dataclass

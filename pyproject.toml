@@ -25,19 +25,16 @@ classifiers = [
 ]
 
 # Hard runtime dependencies. Lower bounds only — see the note in README about
-# pinning exact versions for reproducible scientific runs.
+# pinning exact versions for reproducible scientific runs. mmh3 is REQUIRED:
+# it is the sole, pinned hash backend, and there is no fallback (a different
+# backend would silently produce incomparable signatures).
 dependencies = [
     "numpy>=1.21",
     "scipy>=1.7",
+    "mmh3>=4.0",
 ]
 
 [project.optional-dependencies]
-# Faster MinHash backends. The code auto-detects these and falls back to
-# hashlib (SHA-256) when neither is installed, so they are strictly optional.
-fast-hash = [
-    "mmh3>=3.0",
-    "xxhash>=2.0",
-]
 # Development / CI tooling.
 dev = [
     "pytest>=7.0",

@@ -8,16 +8,16 @@ Optimized implementation (v2):
     2. Batch hashing: _hash_kmer_multiple_batch() computes all k-mer hash
        vectors in a single (n_kmers × num_hashes) NumPy operation, enabling
        a vectorized column-wise minimum for signature construction.
-    3. Auto-selects the fastest available hash backend:
-         mmh3 > xxhash > hashlib (SHA-256 fallback)
-       Even the fallback is ~50x faster than the original due to (1).
+    3. Single pinned hash backend: mmh3 (MurmurHash3, x64 128-bit variant).
+       mmh3 is a hard install requirement — there is NO silent fallback to
+       another hash function, because signatures built with a different
+       backend are not comparable even at identical num_hashes/seed/k.
 
-    Measured speedup: ~55x with SHA-256 fallback, ~500-1000x with mmh3.
-    All public APIs are unchanged — drop-in replacement.
+    Measured speedup: ~500-1000x over the original per-k-mer SHA-256 loop.
+    All public APIs are unchanged.
 """
 
 import struct
-import hashlib
 import logging
 import numpy as np
 from typing import Dict, List, Optional, Set, Tuple
@@ -27,21 +27,29 @@ from ..config import KmerConfig, SEGMENTS
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Hash backend auto-detection
+# Hash backend — mmh3 only, no fallback
 # ---------------------------------------------------------------------------
+#
+# mmh3 is a *required* dependency.  We deliberately do NOT fall back to xxhash
+# or hashlib: a silent backend switch produces signatures that are byte-for-byte
+# incomparable to every other machine's at the same num_hashes/seed/k, which is
+# the single most insidious reproducibility failure for this tool.  If mmh3 is
+# missing we raise immediately with an actionable message rather than degrade.
 
-_HASH_BACKEND = "hashlib"
+HASH_BACKEND = "mmh3"
+MMH3_X64ARCH = True  # MurmurHash3 has two 128-bit variants; pin the x64 one so
+                     # the hash output is stable across mmh3 versions/platforms.
+
 try:
     import mmh3
-    _HASH_BACKEND = "mmh3"
-except ImportError:
-    try:
-        import xxhash
-        _HASH_BACKEND = "xxhash"
-    except ImportError:
-        pass
-
-logger.debug(f"kmer_extractor hash backend: {_HASH_BACKEND}")
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "The 'mmh3' package is required to build MinHash signatures but is not "
+        "installed. Install it with `pip install mmh3` (or `pip install -e .`, "
+        "which now lists mmh3 as a core dependency). There is intentionally no "
+        "fallback hash backend, because signatures built with a different hash "
+        "function are not comparable."
+    ) from exc
 
 # ---------------------------------------------------------------------------
 # Core k-mer utilities
@@ -105,50 +113,20 @@ def extract_kmer_frequencies(sequence: str, k: int, canonical: bool = True) -> D
 
 def _hash_pair(kmer: str, seed: int = 42) -> Tuple[np.uint64, np.uint64]:
     """
-    Compute two independent 64-bit hashes for a k-mer.
+    Compute two independent 64-bit hashes for a k-mer using mmh3.
 
-    Uses the best available backend:
-      - mmh3:    MurmurHash3_128 → split into two 64-bit halves
-      - xxhash:  two xxh64 calls with different seeds
-      - hashlib: SHA-256 → first 16 bytes → split into two 64-bit values
+    MurmurHash3_128 (x64 variant) is computed once and split into two 64-bit
+    halves, which seed the Kirsch-Mitzenmacher expansion downstream.
 
     Returns
     -------
     (h1, h2) : tuple of np.uint64
     """
     data = kmer.encode("ascii")
-    if _HASH_BACKEND == "mmh3":
-        h128 = mmh3.hash128(data, seed, signed=False)
-        h1 = np.uint64(h128 & 0xFFFFFFFFFFFFFFFF)
-        h2 = np.uint64(h128 >> 64)
-        return h1, h2
-    elif _HASH_BACKEND == "xxhash":
-        h1 = np.uint64(xxhash.xxh64_intdigest(data, seed=seed))
-        h2 = np.uint64(xxhash.xxh64_intdigest(data, seed=seed + 0x9E3779B9))
-        return h1, h2
-    else:
-        # SHA-256 fallback: ONE call per k-mer (vs num_hashes in the original)
-        digest = hashlib.sha256(data + struct.pack("<I", seed)).digest()
-        h1 = np.uint64(struct.unpack("<Q", digest[0:8])[0])
-        h2 = np.uint64(struct.unpack("<Q", digest[8:16])[0])
-        return h1, h2
-
-
-def _hash_kmer(kmer: str, seed: int = 0) -> int:
-    """
-    Hash a single k-mer to a uint64 value.
-
-    Backward-compatible with the original API. Used by code that calls
-    _hash_kmer(kmer, seed) directly.
-    """
-    data = kmer.encode("ascii") + struct.pack("<I", seed)
-    if _HASH_BACKEND == "mmh3":
-        return mmh3.hash128(data, seed, signed=False) & 0xFFFFFFFFFFFFFFFF
-    elif _HASH_BACKEND == "xxhash":
-        return xxhash.xxh64_intdigest(data, seed=seed)
-    else:
-        digest = hashlib.sha256(data).digest()
-        return struct.unpack("<Q", digest[:8])[0]
+    h128 = mmh3.hash128(data, seed, x64arch=MMH3_X64ARCH, signed=False)
+    h1 = np.uint64(h128 & 0xFFFFFFFFFFFFFFFF)
+    h2 = np.uint64(h128 >> 64)
+    return h1, h2
 
 
 def _hash_kmer_multiple(kmer: str, num_hashes: int, base_seed: int = 42) -> np.ndarray:
@@ -189,6 +167,47 @@ def _hash_kmer_multiple_batch(
     # Broadcasting: (n, 1) + (1, num_hashes) * (n, 1) → (n, num_hashes)
     indices = np.arange(num_hashes, dtype=np.uint64).reshape(1, -1)
     return h1_arr.reshape(-1, 1) + indices * h2_arr.reshape(-1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Determinism self-test
+# ---------------------------------------------------------------------------
+#
+# Golden vector: the mmh3 x64 128-bit hash of a fixed 21-mer at seed 42, split
+# into its two 64-bit halves. If a future mmh3 version, a different build, or a
+# changed variant flag ever alters the output, this trips loudly instead of
+# silently producing a database of signatures incompatible with everyone else's.
+# Regenerate ONLY with deliberate intent (it invalidates every existing DB).
+_SELFTEST_KMER = "ACGTACGTACGTACGTACGTA"
+_SELFTEST_SEED = 42
+_SELFTEST_EXPECTED = (13036166743686632327, 4543100632486228299)  # (h1, h2)
+
+
+def selftest(raise_on_failure: bool = True) -> bool:
+    """Verify the hash backend reproduces the pinned golden vector.
+
+    Call this at startup / in CI to fail fast on any backend, version, or
+    variant drift before a single signature is written.
+
+    Returns True on success.  If ``raise_on_failure`` is True (default), a
+    mismatch raises RuntimeError; otherwise it returns False.
+    """
+    h1, h2 = _hash_pair(_SELFTEST_KMER, _SELFTEST_SEED)
+    got = (int(h1), int(h2))
+    if got != _SELFTEST_EXPECTED:
+        msg = (
+            "MinHash hash backend self-test FAILED — signatures built here will "
+            "not be comparable to the reference. "
+            f"k-mer={_SELFTEST_KMER!r} seed={_SELFTEST_SEED} "
+            f"expected={_SELFTEST_EXPECTED} got={got}. "
+            "Check the installed mmh3 version and the x64arch variant flag."
+        )
+        if raise_on_failure:
+            raise RuntimeError(msg)
+        logger.error(msg)
+        return False
+    logger.debug("kmer_extractor hash backend self-test passed (mmh3, x64).")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +256,23 @@ class MinHashSignature:
 
     @staticmethod
     def jaccard_similarity(sig_a: "MinHashSignature", sig_b: "MinHashSignature") -> float:
-        """Estimate Jaccard similarity from two MinHash signatures."""
-        if sig_a.num_hashes != sig_b.num_hashes:
-            raise ValueError("Signatures must have the same number of hashes")
+        """Estimate Jaccard similarity from two MinHash signatures.
+
+        Refuses to compare signatures built with different parameters.  A
+        ``num_hashes`` mismatch is a dimension error; a ``seed`` mismatch
+        produces same-length but semantically incomparable signatures that
+        would otherwise yield a silently meaningless similarity.  Both are
+        caught here.  (Backend is pinned to mmh3 process-wide and ``canonical``
+        is enforced database-wide via the signature fingerprint, so neither can
+        vary between two signatures that reach this point.)
+        """
+        if sig_a.num_hashes != sig_b.num_hashes or sig_a.seed != sig_b.seed:
+            raise ValueError(
+                "Incomparable MinHash signatures: "
+                f"(num_hashes={sig_a.num_hashes}, seed={sig_a.seed}) vs "
+                f"(num_hashes={sig_b.num_hashes}, seed={sig_b.seed}). "
+                "They were built with different parameters and cannot be compared."
+            )
         return float(np.sum(sig_a.signature == sig_b.signature)) / sig_a.num_hashes
 
     def to_bytes(self) -> bytes:
