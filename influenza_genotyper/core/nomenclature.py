@@ -7,8 +7,8 @@ full-genome constellation genotypes. Persists all registries to the database.
 Allele format:    {segment}.{subtype_num}.{zero-padded ID}
                   e.g. HA.3.0042, PB2.1.0008, NA.2.0007
 
-Constellation:    {HxNx}-{4-char hex hash}
-                  e.g. H3N2-A7F2, H1N1-B3E9
+Constellation:    {HxNx}-{12-char hex hash}
+                  e.g. H3N2-A7F2B3E91C4D, H1N1-B3E9C1A52F7B
 
 Allele stability guarantee
 --------------------------
@@ -82,6 +82,15 @@ def subtype_short(subtype: str) -> str:
     raise ValueError(f"Cannot determine short subtype for: {subtype}")
 
 
+# Number of hex characters from the SHA-256 digest used in a constellation ID.
+# 12 hex chars = 48 bits. By the birthday bound, a 50% collision probability is
+# only reached past ~20 million distinct constellations per subtype prefix —
+# far beyond any realistic surveillance scale — so the ID can be a pure,
+# order-independent function of the allele combination with no slide/retry.
+# (The previous 4-char / 16-bit width reached 50% at ~300 constellations.)
+_CONSTELLATION_HASH_CHARS = 12
+
+
 # ---------------------------------------------------------------------------
 # Centroid index — vectorised similarity search
 # ---------------------------------------------------------------------------
@@ -116,9 +125,6 @@ class _CentroidIndex:
         self._matrix: Optional[np.ndarray] = None
         # Rows added since last consolidation — avoids per-add vstack cost
         self._pending_rows: List[np.ndarray] = []
-        # allele_name -> observed (distance) radius of that lineage.  Grows as
-        # member-clusters are assigned; consumed by nearest-lineage assignment.
-        self._radius: Dict[str, float] = {}
 
     def _consolidate(self) -> None:
         """Merge any pending rows into the consolidated matrix.
@@ -135,19 +141,16 @@ class _CentroidIndex:
             self._matrix = np.vstack([self._matrix, pending])
         self._pending_rows = []
 
-    def add(self, allele_name: str, signature: MinHashSignature,
-            radius: float = 0.0) -> None:
+    def add(self, allele_name: str, signature: MinHashSignature) -> None:
         """Append a centroid to the index.
 
         Before the first ``best_match()`` call, rows are buffered in
         ``_pending_rows`` (O(1)).  After the matrix has been consolidated
         once, pending rows are merged immediately so that ``best_match``
-        always sees a complete matrix.  ``radius`` is the lineage's observed
-        distance spread (0.0 for a freshly-minted, single-member lineage).
+        always sees a complete matrix.
         """
         row = signature.signature.astype(np.uint64)  # (d,)
         self._names.append(allele_name)
-        self._radius[allele_name] = float(radius)
         if self._matrix is None:
             # Still in accumulation phase — buffer the row
             self._pending_rows.append(row)
@@ -156,40 +159,14 @@ class _CentroidIndex:
             self._pending_rows.append(row)
             self._consolidate()
 
-    def get_radius(self, allele_name: str) -> float:
-        return self._radius.get(allele_name, 0.0)
-
-    @staticmethod
-    def _allele_num(name: str) -> float:
-        """Parse the trailing zero-padded counter from an allele name.
-
-        ``"PB1.3.0042"`` -> ``42``.  Returns ``inf`` for unparseable names so
-        they sort *after* well-formed ones in the oldest-wins tie-break.
-        """
-        try:
-            return float(int(name.rsplit(".", 1)[1]))
-        except (IndexError, ValueError):
-            return float("inf")
-
     def best_match(
         self, query: MinHashSignature, threshold: float
-    ) -> Optional[Tuple[str, float]]:
-        """Return ``(allele_name, similarity)`` for the best allele to reuse,
-        or ``None`` if no stored centroid clears *threshold*.
+    ) -> Optional[str]:
+        """Return the allele name whose centroid is most similar to *query*,
+        provided that similarity exceeds *threshold*.  Returns None otherwise.
 
-        Selection rule — **oldest wins, not most similar.**  Among *every*
-        centroid whose Jaccard similarity meets the threshold, the allele with
-        the lowest allele number (i.e. the earliest minted) is returned.  This
-        is the stability-preserving choice: when a lineage is represented by
-        more than one near-duplicate centroid in the registry, a re-clustered
-        cluster must re-attach to the original allele name rather than drift to
-        a marginally-more-similar but newer duplicate.  Ties on allele number
-        (which should not occur within a single index) fall back to insertion
-        order.
-
-        Uses vectorised broadcasting: all Jaccard similarities are computed in
-        a single (N, d) == (1, d) comparison, avoiding Python loops over
-        alleles.  Returning the similarity lets callers avoid recomputing it.
+        Uses vectorised broadcasting: computes all Jaccard similarities in a
+        single (N, d) == (1, d) comparison, avoiding Python loops over alleles.
         """
         if not self._names:
             return None
@@ -204,66 +181,23 @@ class _CentroidIndex:
         # Broadcasting: (N, d) == (1, d) → (N, d) bool
         matches = self._matrix == q
         similarities = np.mean(matches, axis=1)                # (N,)
+        best_sim = float(similarities.max())
 
-        qualifying = np.nonzero(similarities >= threshold)[0]
-        if qualifying.size == 0:
+        if best_sim < threshold:
             return None
 
-        # Oldest-wins: lowest allele number among all above-threshold matches,
-        # breaking ties by insertion order.
-        best_idx = min(
-            (int(i) for i in qualifying),
-            key=lambda i: (self._allele_num(self._names[i]), i),
-        )
-        return self._names[best_idx], float(similarities[best_idx])
-
-    def nearest_match(
-        self, query: MinHashSignature, tie_eps: float = 1e-9
-    ) -> Optional[Tuple[str, float, float, float]]:
-        """Return the *nearest* stored lineage (no threshold gate).
-
-        Returns ``(allele_name, similarity, radius, runner_up_similarity)`` or
-        ``None`` if the index is empty.  Unlike ``best_match`` (which applies an
-        absolute threshold), this answers the relative question "which lineage
-        is closest" — the basis of nearest-lineage assignment.  The caller then
-        decides drift-vs-novelty using the returned lineage radius.
-
-        Oldest-wins tie-break: among centroids within ``tie_eps`` of the maximum
-        similarity (near-duplicate lineages), the lowest allele number is
-        returned, preserving name stability.  ``runner_up_similarity`` is the
-        best similarity to any *other* lineage, used for boundary-ambiguity
-        (confidence) flagging.
-        """
-        if not self._names:
-            return None
-        self._consolidate()
-        if self._matrix is None:
-            return None
-
-        q = query.signature.reshape(1, -1).astype(np.uint64)
-        similarities = np.mean(self._matrix == q, axis=1)   # (N,)
-        top = float(similarities.max())
-
-        near_top = np.nonzero(similarities >= top - tie_eps)[0]
-        best_idx = min(
-            (int(i) for i in near_top),
-            key=lambda i: (self._allele_num(self._names[i]), i),
-        )
-
-        # Runner-up: best similarity to a lineage other than the chosen one.
-        if len(similarities) > 1:
-            masked = similarities.copy()
-            masked[best_idx] = -1.0
-            runner_up = float(masked.max())
-        else:
-            runner_up = -1.0
-
-        return (
-            self._names[best_idx],
-            float(similarities[best_idx]),
-            self._radius.get(self._names[best_idx], 0.0),
-            runner_up,
-        )
+        # Deterministic tie-break: when several centroids share the maximum
+        # similarity, return the lexicographically smallest allele name rather
+        # than the lowest array index. np.argmax would return the first-inserted
+        # row, making the result depend on insertion order (DB load order, and
+        # any future parallel processing). Allele names are stable and globally
+        # unique, and because they are zero-padded (e.g. PB1.3.0001) the smallest
+        # name is also the lowest allele number — preserving the original
+        # "oldest lineage wins" intent without the order dependence.
+        tied = np.flatnonzero(similarities == best_sim)
+        if tied.size == 1:
+            return self._names[int(tied[0])]
+        return min(self._names[int(i)] for i in tied)
 
     def __len__(self) -> int:
         return len(self._names)
@@ -286,27 +220,8 @@ class NomenclatureManager:
     db : DatabaseManager, optional
         If provided, all registry operations are persisted.
     clustering_config : ClusteringConfig, optional
-        Provides per-segment same-cluster Jaccard thresholds used as the *floor*
-        of each lineage's novelty margin in nearest-lineage assignment.  When
-        omitted, a default ClusteringConfig is used.
-
-    Nearest-lineage assignment
-    ---------------------------
-    A query cluster is assigned to the *nearest* existing lineage rather than to
-    any lineage clearing a fixed similarity threshold.  A new lineage is minted
-    only when the query's distance to the nearest lineage exceeds that lineage's
-    novelty margin, where
-
-        margin = novelty_factor x clamp(observed_radius, floor, ceiling)
-        floor  = 1 - same_cluster_threshold(segment, subtype)
-        ceiling = radius_ceiling_factor x floor
-
-    The margin is therefore *relative* to each lineage's own observed spread —
-    not a single global cutoff — with the per-segment same-cluster threshold as
-    a sane lower bound and a ceiling to bound runaway lumping.  These knobs are
-    read from ClusteringConfig if present (``novelty_factor``,
-    ``radius_ceiling_factor``, ``boundary_confidence_band``) and otherwise
-    default to 1.0 / 2.0 / 0.25.
+        Provides per-segment same-cluster Jaccard thresholds used for centroid
+        similarity matching.  When omitted, a default ClusteringConfig is used.
     """
 
     def __init__(
@@ -335,44 +250,6 @@ class NomenclatureManager:
         # names are known.
         self._pending_lineage: Dict[Tuple[str, str], Tuple[str, float]] = {}
 
-        # subtype_num -> canonical subtype string, restricted to subtypes that
-        # carry a threshold adjustment.  Used so that cross-subtype centroid
-        # search applies the *matched* subtype's threshold rather than the
-        # declaring isolate's (whose adjustment was calibrated for a different
-        # subtype's within-clade diversity).  Falls back to the declaring
-        # subtype when a stored subtype_num is not in this map.
-        self._snum_to_subtype: Dict[int, str] = {}
-        for _st in self._clustering_config.subtype_adjustments:
-            try:
-                self._snum_to_subtype.setdefault(subtype_num(_st), _st)
-            except ValueError:
-                continue
-
-        # Allele names minted from a single orphan sequence ("provisional
-        # founders").  Such alleles are statistically unverified — they bypass
-        # the clustering engine's min_cluster_size gate — so they are tracked
-        # here (and persisted via the registry's `provisional` column) so they
-        # are distinguishable and prunable.  A provisional allele is promoted
-        # to established the first time a real (clustered) assignment reuses it.
-        self._provisional_alleles: set = set()
-
-        # Nearest-lineage novelty knobs (read from config if present).  These
-        # are sensitivity dials applied *relative* to each lineage's spread —
-        # not boundary-placement constants.
-        cc = self._clustering_config
-        self._novelty_factor = float(getattr(cc, "novelty_factor", 1.0))
-        self._radius_ceiling_factor = float(getattr(cc, "radius_ceiling_factor", 2.0))
-        self._boundary_confidence_band = float(
-            getattr(cc, "boundary_confidence_band", 0.25)
-        )
-
-        # seq_id -> list of segments whose latest assignment was boundary-
-        # ambiguous (near-equidistant between two lineages).  Reset per batch.
-        self._batch_low_confidence: Dict[str, List[str]] = {}
-        # Set transiently by assign_allele so the batch driver can attribute a
-        # low-confidence assignment to the right (seq_id, segment).
-        self._last_assignment_low_confidence: bool = False
-
     # ------------------------------------------------------------------
     # Startup loading
     # ------------------------------------------------------------------
@@ -393,11 +270,7 @@ class NomenclatureManager:
                    row.get("cluster_version") or "", row["internal_cluster_id"])
             self._allele_cache[key] = row["allele_name"]
 
-            if row.get("provisional"):
-                self._provisional_alleles.add(row["allele_name"])
-
-            # Rebuild centroid index from stored signatures, carrying the
-            # observed per-lineage radius used by nearest-lineage assignment.
+            # Rebuild centroid index from stored signatures
             sig_bytes = row.get("centroid_signature")
             if sig_bytes:
                 try:
@@ -405,10 +278,7 @@ class NomenclatureManager:
                     idx_key = (row["segment_name"], row["subtype_num"])
                     if idx_key not in self._centroid_indices:
                         self._centroid_indices[idx_key] = _CentroidIndex()
-                    self._centroid_indices[idx_key].add(
-                        row["allele_name"], sig,
-                        radius=float(row.get("radius") or 0.0),
-                    )
+                    self._centroid_indices[idx_key].add(row["allele_name"], sig)
                 except Exception as exc:
                     logger.warning(
                         f"Could not deserialise centroid for {row['allele_name']}: {exc}"
@@ -439,8 +309,6 @@ class NomenclatureManager:
         internal_cluster_id: str,
         cluster_version: Optional[str] = None,
         centroid_signature: Optional[MinHashSignature] = None,
-        provisional: bool = False,
-        cluster_radius: float = 0.0,
     ) -> str:
         """Get or create a stable allele name for a cluster.
 
@@ -489,104 +357,73 @@ class NomenclatureManager:
         # ── Stage 1: cache hit by version-scoped cluster ID ─────────────────
         if key in self._allele_cache:
             allele_name = self._allele_cache[key]
-            if not provisional:
-                self._promote_if_provisional(allele_name)
             if self.db:
                 self.db.update_allele_last_seen(allele_name)
             return allele_name
 
-        # ── Stage 2: nearest-lineage assignment ─────────────────────────────
-        # Assign to the *nearest* existing lineage (same- or cross-subtype),
-        # minting only when the query is beyond that lineage's novelty margin.
-        # The margin is relative to each lineage's observed spread, floored by
-        # the per-segment same-cluster threshold and capped by the ceiling.
+        # ── Stage 2: centroid similarity search ─────────────────────────────
         if centroid_signature is not None:
-            self._last_assignment_low_confidence = False
+            threshold = self._clustering_config.get_threshold(
+                segment_name, subtype, "same"
+            )
 
-            # Collect each candidate index's nearest lineage + its margin.
-            # candidate = (sim, name, owning_idx_key, dist, margin, is_cross)
-            candidates = []
-            per_index_nearest_sims = []      # for global runner-up / confidence
-            within_index_runner_up = -1.0    # runner-up inside the chosen index
-            for idx_key, index in self._centroid_indices.items():
-                if idx_key[0] != segment_name or len(index) == 0:
-                    continue
-                nm = index.nearest_match(centroid_signature)
-                if nm is None:
-                    continue
-                name, sim, radius, runner_up = nm
-                is_cross = (idx_key[1] != snum)
-                cand_subtype = (
-                    subtype if not is_cross
-                    else self._snum_to_subtype.get(idx_key[1], subtype)
-                )
-                floor_d = 1.0 - self._clustering_config.get_threshold(
-                    segment_name, cand_subtype, "same"
-                )
-                ceiling_d = self._radius_ceiling_factor * floor_d
-                eff_radius = min(max(radius, floor_d), ceiling_d)
-                margin = self._novelty_factor * eff_radius
-                dist = 1.0 - sim
-                candidates.append((sim, name, idx_key, dist, margin, is_cross, runner_up))
-                per_index_nearest_sims.append(sim)
-
-            if candidates:
-                # Nearest overall = highest similarity; oldest-wins on near-ties.
-                top_sim = max(c[0] for c in candidates)
-                near_top = [c for c in candidates if c[0] >= top_sim - 1e-9]
-                best = min(near_top, key=lambda c: (_CentroidIndex._allele_num(c[1])))
-                sim, name, idx_key, dist, margin, is_cross, runner_up = best
-
-                # Global runner-up for boundary-ambiguity: the best similarity to
-                # any *other* lineage, whether in this index or another.
-                others = [s for s in per_index_nearest_sims if s < sim - 1e-9]
-                second = max(others + [runner_up]) if (others or runner_up >= 0) else -1.0
-
-                if dist <= margin:
-                    # Within the lineage's basin → drift, not novelty. Assign.
-                    # NOTE: the lineage radius is *not* mutated here. It is
-                    # write-once cluster geometry (set at mint from the founding
-                    # cluster's member spread, recomputed only at recluster),
-                    # exactly like the centroid and mean_diameter. Keeping it
-                    # read-only in the naming layer is what makes within-version
-                    # assignment order-independent and machine-independent, and
-                    # makes single-linkage chaining structurally impossible
-                    # between reclusters (a basin that never grows can't creep
-                    # across a boundary).
-
-                    # Boundary-ambiguity flag: near-equidistant to a 2nd lineage.
-                    if second >= 0 and (sim - second) < self._boundary_confidence_band * max(margin, 1e-9):
-                        self._last_assignment_low_confidence = True
-
-                    self._allele_cache[key] = name
-                    if not provisional:
-                        self._promote_if_provisional(name)
+            # 2a: same-subtype index first (most common case, fast path)
+            same_idx_key = (segment_name, snum)
+            same_index = self._centroid_indices.get(same_idx_key)
+            if same_index is not None and len(same_index) > 0:
+                matched_name = same_index.best_match(centroid_signature, threshold)
+                if matched_name is not None:
+                    self._allele_cache[key] = matched_name
                     if self.db:
-                        self.db.update_allele_last_seen(name)
+                        self.db.update_allele_last_seen(matched_name)
+                    logger.debug(
+                        f"Same-subtype centroid match: {segment_name}/{subtype} "
+                        f"cluster {internal_cluster_id} → {matched_name} "
+                        f"(threshold={threshold:.3f})"
+                    )
+                    return matched_name
 
-                    if is_cross:
-                        self._pending_lineage[(internal_cluster_id, segment_name)] = (
-                            name, sim
-                        )
-                        logger.info(
-                            f"Nearest-lineage (cross-subtype) match: "
-                            f"{segment_name}/{subtype} cluster {internal_cluster_id} "
-                            f"→ {name} (sim={sim:.3f}, dist={dist:.3f} ≤ "
-                            f"margin={margin:.3f}) — possible reassorted segment"
-                        )
-                    else:
-                        logger.debug(
-                            f"Nearest-lineage match: {segment_name}/{subtype} "
-                            f"cluster {internal_cluster_id} → {name} "
-                            f"(sim={sim:.3f}, dist={dist:.3f} ≤ margin={margin:.3f}, "
-                            f"low_conf={self._last_assignment_low_confidence})"
-                        )
-                    return name
-                # else: nearest is beyond its novelty margin → fall through to mint
-                logger.debug(
-                    f"Novelty: {segment_name}/{subtype} cluster {internal_cluster_id} "
-                    f"nearest {name} dist={dist:.3f} > margin={margin:.3f} → mint"
+            # 2b: cross-subtype search — covers reassorted segments whose
+            # lineage belongs to a different subtype than the host isolate.
+            # Iterates all other segment indices regardless of subtype_num.
+            best_cross_name: Optional[str] = None
+            best_cross_sim: float = 0.0
+            for idx_key, index in self._centroid_indices.items():
+                if idx_key[0] != segment_name:
+                    continue  # different segment — skip
+                if idx_key[1] == snum:
+                    continue  # already searched above — skip
+                if len(index) == 0:
+                    continue
+                matched_name = index.best_match(centroid_signature, threshold)
+                if matched_name is not None:
+                    # Pick the best match across all cross-subtype indices
+                    # (best_match already enforces threshold, so any match is
+                    # valid; we prefer the highest similarity if >1 index hits)
+                    index._consolidate()
+                    q = centroid_signature.signature.reshape(1, -1).astype("uint64")
+                    sims = np.mean(index._matrix == q, axis=1)
+                    sim = float(sims.max())
+                    if sim > best_cross_sim:
+                        best_cross_sim = sim
+                        best_cross_name = matched_name
+
+            if best_cross_name is not None:
+                self._allele_cache[key] = best_cross_name
+                if self.db:
+                    self.db.update_allele_last_seen(best_cross_name)
+                logger.info(
+                    f"Cross-subtype centroid match: {segment_name}/{subtype} "
+                    f"cluster {internal_cluster_id} → {best_cross_name} "
+                    f"(sim={best_cross_sim:.3f}, threshold={threshold:.3f}) "
+                    f"— possible reassorted segment"
                 )
+                # Stash the cross-subtype match so name_genotypes_batch Pass 2
+                # can record the lineage link once it knows both allele names.
+                self._pending_lineage[(internal_cluster_id, segment_name)] = (
+                    best_cross_name, best_cross_sim
+                )
+                return best_cross_name
 
         else:
             # Warn only when there are stored centroids to match against —
@@ -613,26 +450,13 @@ class NomenclatureManager:
         allele_name = f"{segment_name}.{snum}.{allele_num:04d}"
         self._allele_cache[key] = allele_name
 
-        # The new lineage's basin radius is its cluster's own member spread,
-        # clamped to the per-segment ceiling.  This is what makes nearest-lineage
-        # assignment tolerate drift: a genuinely broad lineage starts with a wide
-        # margin, a tight one starts narrow.  (Singletons/orphans have radius 0
-        # and fall back to the per-segment floor at decision time.)
-        mint_floor_d = 1.0 - self._clustering_config.get_threshold(
-            segment_name, subtype, "same"
-        )
-        mint_ceiling_d = self._radius_ceiling_factor * mint_floor_d
-        mint_radius = min(max(cluster_radius, 0.0), mint_ceiling_d)
-
         # Add to the declared-subtype centroid index so future sequences
         # can match against this allele in both same- and cross-subtype searches.
         if centroid_signature is not None:
             idx_key = (segment_name, snum)
             if idx_key not in self._centroid_indices:
                 self._centroid_indices[idx_key] = _CentroidIndex()
-            self._centroid_indices[idx_key].add(
-                allele_name, centroid_signature, radius=mint_radius
-            )
+            self._centroid_indices[idx_key].add(allele_name, centroid_signature)
 
         # Persist to DB
         if self.db:
@@ -640,24 +464,12 @@ class NomenclatureManager:
                 allele_name=allele_name,
                 segment_name=segment_name,
                 subtype_num=snum,
-                internal_cluster_id=internal_cluster_id,
                 allele_num=allele_num,
+                internal_cluster_id=internal_cluster_id,
                 cluster_version=cluster_version,
                 centroid_signature=(
                     centroid_signature.to_bytes() if centroid_signature else None
                 ),
-                provisional=provisional,
-                radius=mint_radius,
-            )
-
-        if provisional:
-            # Founded from a single orphan sequence — unverified until a real
-            # clustered assignment corroborates it (see _promote_if_provisional).
-            self._provisional_alleles.add(allele_name)
-            logger.info(
-                f"Provisional allele minted from orphan: {allele_name} "
-                f"({segment_name}/{subtype}, cluster {internal_cluster_id}). "
-                f"Flagged unverified until a clustered assignment reuses it."
             )
 
         # ── Lineage cross-reference ───────────────────────────────────────────
@@ -675,13 +487,13 @@ class NomenclatureManager:
                     continue  # same subtype — not a cross-subtype link
                 if len(index) == 0:
                     continue
-                cross_subtype = self._snum_to_subtype.get(idx_key[1], subtype)
-                cross_threshold = self._clustering_config.get_threshold(
-                    segment_name, cross_subtype, "same"
-                )
-                cross = index.best_match(centroid_signature, cross_threshold)
-                if cross is not None:
-                    cross_match, cross_sim = cross
+                cross_match = index.best_match(centroid_signature, threshold)
+                if cross_match is not None:
+                    # Compute the actual similarity for the record
+                    index._consolidate()
+                    q = centroid_signature.signature.reshape(1, -1).astype("uint64")
+                    sims = np.mean(index._matrix == q, axis=1)
+                    cross_sim = float(sims.max())
                     self.db.record_allele_lineage(
                         allele_name, cross_match, cross_sim,
                         evidence="cross_subtype_centroid_match_at_mint",
@@ -698,37 +510,8 @@ class NomenclatureManager:
         return allele_name
 
     # ------------------------------------------------------------------
-    # Provisional (orphan-founded) allele handling
+    # Batch allele assignment (per-isolate)
     # ------------------------------------------------------------------
-
-    def _promote_if_provisional(self, allele_name: str) -> None:
-        """Mark a provisional allele as established.
-
-        Called when a *clustered* (non-provisional) assignment reuses an allele
-        that was originally founded by a single orphan sequence.  Corroboration
-        by a real cluster is what graduates an orphan founder to an established
-        allele.  No-op for alleles that are already established.
-        """
-        if allele_name in self._provisional_alleles:
-            self._provisional_alleles.discard(allele_name)
-            if self.db:
-                self.db.update_allele_provisional(allele_name, False)
-            logger.info(
-                f"Allele promoted (orphan founder corroborated by a clustered "
-                f"assignment): {allele_name}"
-            )
-
-    def is_provisional(self, allele_name: str) -> bool:
-        """True if *allele_name* was founded by a single orphan sequence and
-        has not since been corroborated by a clustered assignment."""
-        return allele_name in self._provisional_alleles
-
-    def provisional_alleles(self) -> List[str]:
-        """Return the currently-provisional (orphan-founded, uncorroborated)
-        allele names, sorted — these are the prunable founders."""
-        return sorted(self._provisional_alleles)
-
-
 
     def assign_alleles_batch(
         self,
@@ -785,7 +568,6 @@ class NomenclatureManager:
                 alleles[seg] = self.assign_allele(
                     seg, subtype, orphan_cid, cluster_version,
                     centroid_signature=sig,
-                    provisional=True,
                 )
                 logger.debug(
                     f"Orphan allele assigned: {seg}/{subtype} "
@@ -842,25 +624,29 @@ class NomenclatureManager:
 
         prefix = subtype_short(subtype)
         digest = hashlib.sha256(canonical_str.encode()).hexdigest()
-        short_hash = digest[:4].upper()
-        candidate = f"{prefix}-{short_hash}"
+        candidate = f"{prefix}-{digest[:_CONSTELLATION_HASH_CHARS].upper()}"
 
-        in_memory_ids = set(self._constellation_cache.values())
-        offset = 0
-        while True:
-            if candidate in in_memory_ids:
-                offset += 1
-                short_hash = digest[offset:offset + 4].upper()
-                candidate = f"{prefix}-{short_hash}"
-                continue
-            if self.db:
-                db_row = self.db.get_constellation_by_id(candidate)
-                if db_row is not None:
-                    offset += 1
-                    short_hash = digest[offset:offset + 4].upper()
-                    candidate = f"{prefix}-{short_hash}"
-                    continue
-            break
+        # The ID is a pure deterministic function of (subtype prefix, allele
+        # combination): the same constellation always yields the same ID,
+        # independent of the order constellations are first seen. Dedup by the
+        # full allele combination already happened above, so reaching here means
+        # canonical_str is new. If its ID nonetheless already belongs to a
+        # *different* constellation, that is a genuine SHA-256 collision at this
+        # width — astronomically unlikely at any real scale — and we surface it
+        # loudly rather than sliding to an order-dependent window (the old
+        # behaviour, which also ran off the end of the digest at high density).
+        collides = candidate in set(self._constellation_cache.values()) or (
+            self.db is not None
+            and self.db.get_constellation_by_id(candidate) is not None
+        )
+        if collides:
+            raise RuntimeError(
+                f"Constellation ID collision: {candidate!r} is already assigned "
+                f"to a different allele combination than {canonical_str!r}. This "
+                f"indicates a SHA-256 collision at {_CONSTELLATION_HASH_CHARS} hex "
+                f"chars (effectively impossible at realistic scale); raise "
+                f"_CONSTELLATION_HASH_CHARS if it ever genuinely occurs."
+            )
 
         self._constellation_cache[canonical_str] = candidate
         if self.db:
@@ -914,22 +700,25 @@ class NomenclatureManager:
         subtypes: Dict[str, str],
         cluster_version: Optional[str] = None,
         all_centroid_signatures: Optional[Dict[str, Dict[str, MinHashSignature]]] = None,
-        all_cluster_radii: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> Dict[str, Dict]:
         """Name alleles and constellations for a batch of isolates.
 
-        Two-pass strategy for correct cross-subtype matching of reassorted
-        segments:
+        Uses a two-pass strategy to guarantee correct cross-subtype centroid
+        matching for reassorted segments:
 
-        Pass 1 — Clustered segments (all isolates).  Populates every centroid
-            index before any orphan is processed.
+        Pass 1 — Clustered segments only (all isolates, all subtypes).
+            Names every segment that has a real cluster assignment.  This
+            populates all centroid indices for all subtypes before any orphan
+            is processed, so the H3N2 PB1 centroid exists when SAMP12's
+            orphan PB1 is evaluated in Pass 2.
 
-        Pass 2 — Orphan segments.  With complete indices, nearest-lineage
-            assignment (same- and cross-subtype) has the full picture, so a
-            reassortant orphan matches the correct existing lineage rather than
-            minting a spurious one.
+        Pass 2 — Orphan segments only (all isolates).
+            With complete centroid indices now available, Stage 2a (same-
+            subtype) and Stage 2b (cross-subtype) both have the full picture.
+            An H1N1 isolate carrying a reassorted H3N2 PB1 will match
+            ``PB1.3.xxxx`` rather than minting a spurious ``PB1.1.xxxx``.
 
-        Constellation assignment follows once every allele is resolved.
+        Constellation assignment follows Pass 2 once every allele is resolved.
 
         Parameters
         ----------
@@ -939,8 +728,10 @@ class NomenclatureManager:
             sequence_id -> subtype string.
         cluster_version : str, optional
         all_centroid_signatures : dict, optional
-            sequence_id -> {segment_name -> MinHashSignature} (cluster centroid
-            for clustered segments; the sequence's own signature for orphans).
+            sequence_id -> {segment_name -> MinHashSignature}.
+            For clustered segments: the cluster centroid signature.
+            For orphan segments: the sequence's own signature (used as the
+            centroid candidate for allele minting / cross-subtype matching).
         """
         ORPHAN_MARKERS = {"?", "-", None}
 
@@ -948,19 +739,11 @@ class NomenclatureManager:
         allele_results: Dict[str, Dict[str, Optional[str]]] = {
             seq_id: {} for seq_id in all_cluster_assignments
         }
-        # Per-isolate list of segments whose assignment landed near a lineage
-        # boundary (ambiguous) — surfaced for downstream confidence reporting.
-        self._batch_low_confidence = {seq_id: [] for seq_id in all_cluster_assignments}
 
         # ── Pass 1: clustered segments — build all centroid indices ──────────
-        # Iterate isolates in a deterministic (sorted) order so that the
-        # arbitrary allele numbers minted on a cold-start run are reproducible:
-        # the same input data always yields the same {0001, 0002, ...} mapping
-        # regardless of dict insertion order.
-        for seq_id, assignments in sorted(all_cluster_assignments.items()):
+        for seq_id, assignments in all_cluster_assignments.items():
             st   = subtypes.get(seq_id, "H3N2")
             sigs = (all_centroid_signatures or {}).get(seq_id) or {}
-            radii = (all_cluster_radii or {}).get(seq_id) or {}
             for seg in SEGMENTS:
                 cid = assignments.get(seg)
                 if cid and cid not in ORPHAN_MARKERS:
@@ -968,13 +751,10 @@ class NomenclatureManager:
                     allele_results[seq_id][seg] = self.assign_allele(
                         seg, st, cid, cluster_version,
                         centroid_signature=sig,
-                        cluster_radius=radii.get(seg, 0.0),
                     )
-                    if self._last_assignment_low_confidence:
-                        self._batch_low_confidence[seq_id].append(seg)
 
         # ── Pass 2: orphan segments — full cross-subtype search now possible ──
-        for seq_id, assignments in sorted(all_cluster_assignments.items()):
+        for seq_id, assignments in all_cluster_assignments.items():
             st      = subtypes.get(seq_id, "H3N2")
             sigs    = (all_centroid_signatures or {}).get(seq_id) or {}
             seq_label = seq_id
@@ -991,11 +771,12 @@ class NomenclatureManager:
                     allele = self.assign_allele(
                         seg, st, orphan_cid, cluster_version,
                         centroid_signature=sig,
-                        provisional=True,
                     )
                     allele_results[seq_id][seg] = allele
-                    if self._last_assignment_low_confidence:
-                        self._batch_low_confidence[seq_id].append(seg)
+                    logger.debug(
+                        f"Orphan allele assigned: {seg}/{st} "
+                        f"seq={seq_label} → {allele}"
+                    )
                     # Lineage cross-reference: if the assigned allele carries a
                     # different subtype prefix than the declaring isolate, this
                     # is a confirmed cross-subtype assignment.  Record the link
@@ -1015,32 +796,30 @@ class NomenclatureManager:
                             # the allele's own subtype index (where its centroid lives).
                             allele_idx = self._centroid_indices.get((seg, allele_snum))
                             if allele_idx is not None and len(allele_idx) > 0:
-                                allele_subtype = self._snum_to_subtype.get(
-                                    allele_snum, st
+                                threshold = self._clustering_config.get_threshold(
+                                    seg, st, "same"
                                 )
-                                allele_threshold = self._clustering_config.get_threshold(
-                                    seg, allele_subtype, "same"
-                                )
-                                matched = allele_idx.best_match(sig, allele_threshold)
-                                if matched is not None and matched[0] == allele:
-                                    link_sim = matched[1]
+                                matched = allele_idx.best_match(sig, threshold)
+                                if matched == allele:
+                                    allele_idx._consolidate()
+                                    q = sig.signature.reshape(1, -1).astype("uint64")
+                                    sims = np.mean(allele_idx._matrix == q, axis=1)
+                                    link_sim = float(sims.max())
                                     # Also check if the declaring subtype index has
                                     # a same-segment allele from a prior run that
                                     # should be linked (the "PB1.1.0002 is also the
-                                    # H3N2 lineage" case).  Look in the declaring
+                                    # H3N2 lineage" case).
+                                    # The link is simply: allele ↔ allele, but we
+                                    # need a second name. Look in the declaring
                                     # subtype's index for the same signature.
                                     other_idx = self._centroid_indices.get(
                                         (seg, declared_snum)
                                     )
-                                    declared_threshold = self._clustering_config.get_threshold(
-                                        seg, st, "same"
-                                    )
-                                    other = (
-                                        other_idx.best_match(sig, declared_threshold)
+                                    other_match = (
+                                        other_idx.best_match(sig, threshold)
                                         if other_idx and len(other_idx) > 0
                                         else None
                                     )
-                                    other_match = other[0] if other is not None else None
                                     if other_match and other_match != allele:
                                         self.db.record_allele_lineage(
                                             allele, other_match, link_sim,
@@ -1053,6 +832,9 @@ class NomenclatureManager:
                                         )
                                     else:
                                         # No corresponding declared-subtype allele yet.
+                                        # Record the cross-subtype fact using the
+                                        # matched allele and the sequence's orphan
+                                        # synthetic ID as annotation context.
                                         # The link will be properly named on recluster.
                                         pass
                 else:
@@ -1064,15 +846,10 @@ class NomenclatureManager:
             st = subtypes.get(seq_id, "H3N2")
             constellation = self.assign_constellation(alleles, st)
             allele_string = " | ".join(alleles.get(seg) or "?" for seg in SEGMENTS)
-            low_conf = sorted(set(self._batch_low_confidence.get(seq_id, [])))
             results[seq_id] = {
                 "alleles": alleles,
                 "constellation": constellation,
                 "allele_string": allele_string,
-                # Segments whose assignment was near a lineage boundary (the
-                # query sat almost equidistant between two lineages).  These are
-                # the calls to treat as low-confidence for reassortment reporting.
-                "low_confidence_segments": low_conf,
             }
         return results
 
