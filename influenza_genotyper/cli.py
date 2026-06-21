@@ -311,7 +311,7 @@ def print_summary(summary, mode):
     print(f"  Isolates processed  : {summary.get('total_isolates', 0)}")
     print(f"  Complete genomes    : {summary.get('complete_genomes', 0)}")
     if summary.get("by_subtype"):
-        print(f"  By subtype          : " +
+        print("  By subtype          : " +
               ", ".join(f"{st} ({n})" for st, n in sorted(summary["by_subtype"].items())))
     print(f"  Unique genotypes    : {summary.get('unique_genotypes', 0)}")
     if mode in ("batch", "recluster"):

@@ -20,9 +20,9 @@ Optimized implementation (v2):
 import struct
 import logging
 import numpy as np
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
-from ..config import KmerConfig, SEGMENTS
+from ..config import KmerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -99,14 +99,6 @@ def extract_kmer_set(sequence: str, k: int, canonical: bool = True) -> Set[str]:
     return set(extract_kmers(sequence, k, canonical))
 
 
-def extract_kmer_frequencies(sequence: str, k: int, canonical: bool = True) -> Dict[str, int]:
-    """Extract k-mer frequency counts from a sequence."""
-    freqs: Dict[str, int] = {}
-    for kmer in extract_kmers(sequence, k, canonical):
-        freqs[kmer] = freqs.get(kmer, 0) + 1
-    return freqs
-
-
 # ---------------------------------------------------------------------------
 # Optimized hashing — Kirsch-Mitzenmacher trick
 # ---------------------------------------------------------------------------
@@ -127,23 +119,6 @@ def _hash_pair(kmer: str, seed: int = 42) -> Tuple[np.uint64, np.uint64]:
     h1 = np.uint64(h128 & 0xFFFFFFFFFFFFFFFF)
     h2 = np.uint64(h128 >> 64)
     return h1, h2
-
-
-def _hash_kmer_multiple(kmer: str, num_hashes: int, base_seed: int = 42) -> np.ndarray:
-    """
-    Generate num_hashes hash values for a k-mer using Kirsch-Mitzenmacher:
-    h_i(x) = h1(x) + i * h2(x), computed mod 2^64 via uint64 overflow.
-
-    Replaces the original's loop of num_hashes independent SHA-256 calls
-    with 1 hash call + vectorized arithmetic.
-
-    Returns
-    -------
-    np.ndarray of shape (num_hashes,) with dtype uint64
-    """
-    h1, h2 = _hash_pair(kmer, base_seed)
-    indices = np.arange(num_hashes, dtype=np.uint64)
-    return h1 + indices * h2
 
 
 def _hash_kmer_multiple_batch(
@@ -413,10 +388,6 @@ class MinHashSignature:
         sig.signature = np.frombuffer(data[16:], dtype=np.uint64).copy()
         return sig
 
-    def is_empty(self) -> bool:
-        """Check if the signature has been populated."""
-        return self.unique_kmer_count == 0
-
 
 # ---------------------------------------------------------------------------
 # KmerExtractor
@@ -441,55 +412,3 @@ class KmerExtractor:
         sig.update_batch(kmer_set)
         return sig
 
-    def extract_all_segments(self, segments: Dict[str, str]) -> Dict[str, MinHashSignature]:
-        """Extract signatures for all recognized segments."""
-        return {seg: self.extract_signature(seq, seg) for seg, seq in segments.items() if seg in SEGMENTS}
-
-    def compute_pairwise_distances(self, signatures: List[MinHashSignature]) -> np.ndarray:
-        """
-        Compute pairwise Jaccard distance matrix.
-
-        Uses vectorized NumPy broadcasting for ~50-100x speedup over
-        per-pair Python loops.
-        """
-        n = len(signatures)
-        if n == 0:
-            return np.zeros((0, 0), dtype=np.float64)
-
-        # Stack all signature arrays into (n, d) matrix
-        hash_matrix = np.array(
-            [sig.signature for sig in signatures], dtype=np.uint64
-        )
-
-        distances = np.zeros((n, n), dtype=np.float64)
-        for i in range(n - 1):
-            matches = hash_matrix[i] == hash_matrix[i + 1:]  # (n-i-1, d)
-            similarities = np.mean(matches, axis=1)
-            dists = np.clip(1.0 - similarities, 0.0, 1.0)
-            distances[i, i + 1:] = dists
-            distances[i + 1:, i] = dists
-
-        return distances
-
-    def parameter_sweep(self, sequences: List[str], segment_name: str,
-                        k_values: Optional[List[int]] = None) -> Dict[int, Dict]:
-        """Sweep k values and report k-mer statistics for tuning."""
-        if k_values is None:
-            k_values = [15, 17, 19, 21, 23, 25, 27, 29, 31]
-        results = {}
-        for k in k_values:
-            unique_counts = []
-            total_counts = []
-            for seq in sequences:
-                kmer_set = extract_kmer_set(seq, k)
-                kmers_all = extract_kmers(seq, k)
-                unique_counts.append(len(kmer_set))
-                total_counts.append(len(kmers_all))
-            results[k] = {
-                "k": k,
-                "mean_unique_kmers": float(np.mean(unique_counts)),
-                "std_unique_kmers": float(np.std(unique_counts)),
-                "mean_total_kmers": float(np.mean(total_counts)),
-                "saturation": float(np.mean([u/t if t > 0 else 0 for u, t in zip(unique_counts, total_counts)])),
-            }
-        return results

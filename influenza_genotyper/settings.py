@@ -22,8 +22,8 @@ SEGMENT_LENGTH_RANGES = {
 def jaccard_to_ani(jaccard: float, k: int) -> float:
     """Convert a Jaccard similarity to an ANI estimate (Mash formula).
 
-    ``ANI = 1 + (1/k) * ln(2J / (1 + J))``, clamped to ``[0, 1]``.  Used to seed
-    and reason about ANI thresholds from the legacy Jaccard thresholds.
+    ``ANI = 1 + (1/k) * ln(2J / (1 + J))``, clamped to ``[0, 1]``.  Converts a
+    measured Jaccard similarity to an ANI estimate (Mash distance).
     """
     if jaccard <= 0.0:
         return 0.0

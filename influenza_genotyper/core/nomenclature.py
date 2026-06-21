@@ -586,13 +586,6 @@ class NomenclatureManager:
                 alleles[seg] = None
         return alleles
 
-    def get_allele_name(self, segment_name: str, subtype: str,
-                        internal_cluster_id: str,
-                        cluster_version: Optional[str] = None) -> Optional[str]:
-        """Look up an existing allele without creating a new one."""
-        key = (segment_name, subtype_num(subtype),
-               cluster_version or "", internal_cluster_id)
-        return self._allele_cache.get(key)
 
     # ------------------------------------------------------------------
     # Constellation naming
@@ -667,40 +660,6 @@ class NomenclatureManager:
     # Combined naming pipeline
     # ------------------------------------------------------------------
 
-    def name_genotype(
-        self,
-        cluster_assignments: Dict[str, Optional[str]],
-        subtype: str,
-        cluster_version: Optional[str] = None,
-        centroid_signatures: Optional[Dict[str, MinHashSignature]] = None,
-        sequence_id: Optional[str] = None,
-    ) -> Dict:
-        """Full naming pipeline for one isolate: alleles + constellation.
-
-        Parameters
-        ----------
-        cluster_assignments : dict
-            segment_name -> internal_cluster_id.
-        subtype : str
-        cluster_version : str, optional
-        centroid_signatures : dict, optional
-            segment_name -> MinHashSignature.  Pass this to enable Stage 2
-            centroid matching and orphan allele naming.
-        sequence_id : str, optional
-            Used to scope synthetic orphan cluster IDs so different sequences
-            do not incorrectly share an allele below the similarity threshold.
-        """
-        alleles = self.assign_alleles_batch(
-            cluster_assignments, subtype, cluster_version,
-            centroid_signatures, sequence_id=sequence_id,
-        )
-        constellation = self.assign_constellation(alleles, subtype)
-        allele_string = " | ".join(alleles.get(seg) or "?" for seg in SEGMENTS)
-        return {
-            "alleles": alleles,
-            "constellation": constellation,
-            "allele_string": allele_string,
-        }
 
     def name_genotypes_batch(
         self,
@@ -865,11 +824,6 @@ class NomenclatureManager:
     # Registry queries
     # ------------------------------------------------------------------
 
-    def get_allele_count(self) -> int:
-        return len(self._allele_cache)
-
-    def get_constellation_count(self) -> int:
-        return len(self._constellation_cache)
 
     def get_registry_summary(self) -> Dict:
         alleles_by_segment: Dict[str, int] = {}

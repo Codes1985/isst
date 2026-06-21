@@ -14,7 +14,7 @@ Refactored with:
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -143,13 +143,6 @@ class GenotypeProfile:
             for seg in SEGMENTS
         )
 
-    @property
-    def segment_profile(self) -> str:
-        """Verbose labelled profile, e.g. ``PB2:A1 | PB1:A1 | ...``."""
-        return " | ".join(
-            f"{seg}:{self.segment_values[seg].display if seg in self.segment_values else MISSING_MARKER}"
-            for seg in SEGMENTS
-        )
 
     # ------------------------------------------------------------------
     # Completeness
@@ -196,35 +189,6 @@ class GenotypeProfile:
     # ------------------------------------------------------------------
     # Comparison (moved from GenotypeAssigner)
     # ------------------------------------------------------------------
-
-    def compare_to(self, other: "GenotypeProfile") -> Dict:
-        """Compare this profile to another, segment by segment.
-
-        Returns a dict with matching, differing, and incomparable segment
-        lists plus a similarity score over the comparable segments.
-        """
-        matching, differing, incomparable = [], [], []
-        for seg in SEGMENTS:
-            val_a = self.segment_values.get(seg)
-            val_b = other.segment_values.get(seg)
-
-            a_comparable = val_a is not None and val_a.is_assigned
-            b_comparable = val_b is not None and val_b.is_assigned
-
-            if not a_comparable or not b_comparable:
-                incomparable.append(seg)
-            elif val_a.cluster_id == val_b.cluster_id:
-                matching.append(seg)
-            else:
-                differing.append(seg)
-
-        comparable_count = len(matching) + len(differing)
-        return {
-            "matching": matching,
-            "differing": differing,
-            "incomparable": incomparable,
-            "similarity": len(matching) / max(comparable_count, 1),
-        }
 
 
 # ---------------------------------------------------------------------------

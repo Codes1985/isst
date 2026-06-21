@@ -24,9 +24,9 @@ import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from ..config import ClusteringConfig, KmerConfig, SEGMENTS, ani_to_jaccard
+from ..config import ClusteringConfig, KmerConfig, ani_to_jaccard
 from .kmer_extractor import MinHashSignature
 
 logger = logging.getLogger(__name__)
@@ -267,11 +267,7 @@ class ClusteringEngine:
         # --- Threshold ------------------------------------------------------
         # The control surface is ANI: read the per-segment/subtype same-cluster
         # ANI threshold and convert it to the Jaccard cut height the linkage
-        # tree is actually built on. For the zero-adjustment subtype this is
-        # numerically identical to the legacy Jaccard cut (to table rounding,
-        # ~1e-4); for H3N2 the representative ANI subtype adjustment shifts the
-        # effective cut by up to ~3e-3 Jaccard versus the legacy -0.02 (the
-        # known approximation to tune later). It moves the knob to ANI.
+        # tree is actually built on.
         ani_threshold = self.config.get_ani_threshold(segment_name, subtype, "same")
         k = self.kmer_config.get_k(segment_name)
         jaccard_cut = ani_to_jaccard(ani_threshold, k)

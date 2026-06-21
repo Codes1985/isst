@@ -1040,7 +1040,7 @@ class GenotypingPipeline:
             similarity : float
                 Jaccard similarity between the two allele centroids.
         """
-        from .core.nomenclature import NomenclatureManager, subtype_num
+        from .core.nomenclature import NomenclatureManager
         from .core.kmer_extractor import MinHashSignature
 
         logger.info(
@@ -1084,8 +1084,6 @@ class GenotypingPipeline:
         )
         repair_nom.load_from_db()
 
-        snum = subtype_num(correct_subtype)
-        idx_key = (segment_name, snum)
         # The misnamed allele was stored under the *wrong* subtype number,
         # so it lives in a different index — but scan all segment indices and
         # remove it cleanly from any that contain it.

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
 
-from ..config import DatabaseConfig, SEGMENTS
+from ..config import DatabaseConfig
 
 logger = logging.getLogger(__name__)
 
@@ -610,17 +610,6 @@ class DatabaseManager:
 
     # ── Sequence CRUD ──────────────────────────────────────────────────
 
-    def insert_sequence(self, sequence_id: str, subtype: str,
-                        collection_date: Optional[str] = None,
-                        metadata: Optional[Dict] = None) -> None:
-        now = _now_iso()
-        with self.connection() as conn:
-            conn.execute(
-                """INSERT OR IGNORE INTO sequences
-                   (sequence_id, collection_date, subtype, metadata_json, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (sequence_id, collection_date, subtype, json.dumps(metadata or {}), now, now),
-            )
 
     def insert_sequence_conn(self, conn: Any, sequence_id: str, subtype: str,
                              collection_date: Optional[str] = None,
@@ -634,16 +623,6 @@ class DatabaseManager:
             (sequence_id, collection_date, subtype, json.dumps(metadata or {}), now, now),
         )
 
-    def update_sequence_status(self, sequence_id: str, status: str,
-                               segments_found: Optional[int] = None) -> None:
-        now = _now_iso()
-        with self.connection() as conn:
-            if segments_found is not None:
-                conn.execute("UPDATE sequences SET status=?, segments_found=?, updated_at=? WHERE sequence_id=?",
-                             (status, segments_found, now, sequence_id))
-            else:
-                conn.execute("UPDATE sequences SET status=?, updated_at=? WHERE sequence_id=?",
-                             (status, now, sequence_id))
 
     def update_sequence_status_conn(self, conn: Any, sequence_id: str, status: str,
                                     segments_found: Optional[int] = None) -> None:
@@ -656,32 +635,9 @@ class DatabaseManager:
             conn.execute("UPDATE sequences SET status=?, updated_at=? WHERE sequence_id=?",
                          (status, now, sequence_id))
 
-    def get_sequence(self, sequence_id: str) -> Optional[Dict]:
-        with self.connection() as conn:
-            row = conn.execute("SELECT * FROM sequences WHERE sequence_id=?", (sequence_id,)).fetchone()
-            return dict(row) if row else None
-
-    def get_sequences_by_subtype(self, subtype: str, status: Optional[str] = None) -> List[Dict]:
-        with self.connection() as conn:
-            if status:
-                rows = conn.execute("SELECT * FROM sequences WHERE subtype=? AND status=?", (subtype, status)).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM sequences WHERE subtype=?", (subtype,)).fetchall()
-            return [dict(r) for r in rows]
 
     # ── Segment k-mer CRUD ─────────────────────────────────────────────
 
-    def insert_segment_kmer(self, sequence_id: str, segment_name: str, k_value: int,
-                            kmer_signature: bytes, sequence_length: int,
-                            cluster_version: str = "v0") -> None:
-        now = _now_iso()
-        with self.connection() as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO segment_kmers
-                   (sequence_id, segment_name, k_value, kmer_signature, sequence_length, cluster_version, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (sequence_id, segment_name, k_value, kmer_signature, sequence_length, cluster_version, now),
-            )
 
     def insert_segment_kmer_conn(self, conn: Any, sequence_id: str, segment_name: str,
                                  k_value: int, kmer_signature: bytes, sequence_length: int,
@@ -695,16 +651,6 @@ class DatabaseManager:
             (sequence_id, segment_name, k_value, kmer_signature, sequence_length, cluster_version, now),
         )
 
-    def update_cluster_assignment(self, sequence_id: str, segment_name: str,
-                                  cluster_id: str, cluster_version: str,
-                                  distance_to_centroid: float, is_orphan: bool = False) -> None:
-        with self.connection() as conn:
-            conn.execute(
-                """UPDATE segment_kmers SET cluster_id=?, distance_to_centroid=?, is_orphan=?
-                   WHERE sequence_id=? AND segment_name=? AND cluster_version=?""",
-                (cluster_id, distance_to_centroid, int(is_orphan),
-                 sequence_id, segment_name, cluster_version),
-            )
 
     def update_cluster_assignment_conn(self, conn: Any, sequence_id: str, segment_name: str,
                                        cluster_id: str, cluster_version: str,
@@ -717,13 +663,6 @@ class DatabaseManager:
              sequence_id, segment_name, cluster_version),
         )
 
-    def update_allele_assignment(self, sequence_id: str, segment_name: str,
-                                 allele_id: str, cluster_version: str) -> None:
-        with self.connection() as conn:
-            conn.execute(
-                "UPDATE segment_kmers SET allele_id=? WHERE sequence_id=? AND segment_name=? AND cluster_version=?",
-                (allele_id, sequence_id, segment_name, cluster_version),
-            )
 
     def update_allele_assignment_conn(self, conn: Any, sequence_id: str, segment_name: str,
                                       allele_id: str, cluster_version: str) -> None:
@@ -735,19 +674,6 @@ class DatabaseManager:
 
     # ── Cluster CRUD ───────────────────────────────────────────────────
 
-    def insert_cluster(self, cluster_id: str, segment_name: str, subtype: str,
-                       centroid_signature: bytes, member_count: int,
-                       mean_diameter: float, version: str) -> None:
-        now = _now_iso()
-        with self.connection() as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO clusters
-                   (cluster_id, segment_name, subtype, centroid_signature,
-                    member_count, mean_diameter, version, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (cluster_id, segment_name, subtype, centroid_signature,
-                 member_count, mean_diameter, version, now, now),
-            )
 
     def insert_cluster_conn(self, conn: Any, cluster_id: str, segment_name: str,
                             subtype: str, centroid_signature: bytes, member_count: int,
@@ -763,12 +689,6 @@ class DatabaseManager:
              member_count, mean_diameter, version, now, now),
         )
 
-    def get_active_clusters(self, segment_name: str, subtype: str) -> List[Dict]:
-        with self.connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM clusters WHERE segment_name=? AND subtype=? AND is_active=1 ORDER BY cluster_id",
-                (segment_name, subtype)).fetchall()
-            return [dict(r) for r in rows]
 
     def get_active_clusters_by_version(self, segment_name: str, subtype: str,
                                        version: str) -> List[Dict]:
@@ -857,30 +777,12 @@ class DatabaseManager:
                  member_count, now, now),
             )
 
-    def get_allele(self, segment_name: str, subtype_num: int,
-                   internal_cluster_id: str) -> Optional[Dict]:
-        with self.connection() as conn:
-            row = conn.execute(
-                "SELECT * FROM allele_registry WHERE segment_name=? AND subtype_num=? AND internal_cluster_id=?",
-                (segment_name, subtype_num, internal_cluster_id)).fetchone()
-            return dict(row) if row else None
 
     def get_allele_by_name(self, allele_name: str) -> Optional[Dict]:
         with self.connection() as conn:
             row = conn.execute("SELECT * FROM allele_registry WHERE allele_name=?", (allele_name,)).fetchone()
             return dict(row) if row else None
 
-    def get_alleles_for_segment(self, segment_name: str, subtype_num: Optional[int] = None) -> List[Dict]:
-        with self.connection() as conn:
-            if subtype_num is not None:
-                rows = conn.execute(
-                    "SELECT * FROM allele_registry WHERE segment_name=? AND subtype_num=? AND is_active=1 ORDER BY allele_num",
-                    (segment_name, subtype_num)).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM allele_registry WHERE segment_name=? AND is_active=1 ORDER BY allele_num",
-                    (segment_name,)).fetchall()
-            return [dict(r) for r in rows]
 
     def update_allele_last_seen(self, allele_name: str, member_count: Optional[int] = None) -> None:
         now = _now_iso()
@@ -968,53 +870,9 @@ class DatabaseManager:
                 logger.info(f"Constellation retired (zero members): {cid}")
             return len(ids)
 
-    def get_all_lineage_links(self) -> List[Dict]:
-        """Return every recorded allele lineage link."""
-        with self.connection() as conn:
-            rows = conn.execute(
-                "SELECT allele_a, allele_b, similarity, evidence, created_at "
-                "FROM allele_lineage ORDER BY created_at"
-            ).fetchall()
-        return [dict(r) for r in rows]
 
     # ── Allele repair helpers ──────────────────────────────────────────
 
-    def get_segment_signatures_for_subtype(self, segment_name: str, subtype: str,
-                                           cluster_version: Optional[str] = None) -> List[Dict]:
-        """Return stored k-mer signatures for all sequences of a given subtype and segment."""
-        with self.connection() as conn:
-            if cluster_version:
-                rows = conn.execute(
-                    """SELECT sk.sequence_id, sk.kmer_signature, sk.cluster_id,
-                              sk.allele_id, sk.cluster_version, sk.is_orphan
-                       FROM segment_kmers sk
-                       JOIN sequences s ON sk.sequence_id = s.sequence_id
-                       WHERE sk.segment_name = ? AND s.subtype = ?
-                         AND sk.cluster_version = ? AND sk.kmer_signature IS NOT NULL""",
-                    (segment_name, subtype, cluster_version),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """SELECT sk.sequence_id, sk.kmer_signature, sk.cluster_id,
-                              sk.allele_id, sk.cluster_version, sk.is_orphan
-                       FROM segment_kmers sk
-                       JOIN sequences s ON sk.sequence_id = s.sequence_id
-                       WHERE sk.segment_name = ? AND s.subtype = ?
-                         AND sk.kmer_signature IS NOT NULL""",
-                    (segment_name, subtype),
-                ).fetchall()
-        return [dict(r) for r in rows]
-
-    def update_genotype_allele_profile(self, sequence_id: str, cluster_version: str,
-                                       allele_profile: str,
-                                       constellation_id: Optional[str]) -> None:
-        """Update allele_profile and constellation_id for an existing genotype row."""
-        with self.connection() as conn:
-            conn.execute(
-                """UPDATE genotypes SET allele_profile = ?, constellation_id = ?
-                   WHERE sequence_id = ? AND cluster_version = ?""",
-                (allele_profile, constellation_id, sequence_id, cluster_version),
-            )
 
     def load_allele_registry(self) -> List[Dict]:
         with self.connection() as conn:
@@ -1069,22 +927,6 @@ class DatabaseManager:
 
     # ── Genotype CRUD ──────────────────────────────────────────────────
 
-    def insert_genotype(self, sequence_id: str, genotype_profile: str,
-                        cluster_version: str, allele_profile: Optional[str] = None,
-                        constellation_id: Optional[str] = None,
-                        reassortment_score: float = 0.0,
-                        reassortment_flag: bool = False,
-                        completeness: float = 1.0) -> None:
-        now = _now_iso()
-        with self.connection() as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO genotypes
-                   (sequence_id, genotype_profile, allele_profile, constellation_id,
-                    cluster_version, reassortment_score, reassortment_flag, completeness, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (sequence_id, genotype_profile, allele_profile, constellation_id,
-                 cluster_version, reassortment_score, int(reassortment_flag), completeness, now),
-            )
 
     def insert_genotype_conn(self, conn: Any, sequence_id: str, genotype_profile: str,
                              cluster_version: str, allele_profile: Optional[str] = None,
@@ -1110,24 +952,9 @@ class DatabaseManager:
                 (sequence_id,)).fetchone()
             return dict(row) if row else None
 
-    def get_genotypes_by_constellation(self, constellation_id: str) -> List[Dict]:
-        with self.connection() as conn:
-            return [dict(r) for r in conn.execute(
-                "SELECT * FROM genotypes WHERE constellation_id=?", (constellation_id,)).fetchall()]
 
     # ── Orphan CRUD ────────────────────────────────────────────────────
 
-    def flag_orphan(self, sequence_id: str, segment_name: str,
-                    nearest_cluster: Optional[str] = None,
-                    nearest_distance: Optional[float] = None) -> None:
-        now = _now_iso()
-        with self.connection() as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO orphan_sequences
-                   (sequence_id, segment_name, nearest_cluster, nearest_distance, flagged_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (sequence_id, segment_name, nearest_cluster, nearest_distance, now),
-            )
 
     def flag_orphan_conn(self, conn: Any, sequence_id: str, segment_name: str,
                          nearest_cluster: Optional[str] = None,
@@ -1175,27 +1002,6 @@ class DatabaseManager:
             return deleted
 
     # ── Summary stats ──────────────────────────────────────────────────
-
-    def get_summary_stats(self) -> Dict:
-        with self.connection() as conn:
-            return {
-                "total_sequences": conn.execute("SELECT COUNT(*) FROM sequences").fetchone()[0],
-                "by_subtype": {r[0]: r[1] for r in conn.execute(
-                    "SELECT subtype, COUNT(*) FROM sequences GROUP BY subtype").fetchall()},
-                "by_status": {r[0]: r[1] for r in conn.execute(
-                    "SELECT status, COUNT(*) FROM sequences GROUP BY status").fetchall()},
-                "total_clusters": conn.execute(
-                    "SELECT COUNT(DISTINCT cluster_id || segment_name) FROM clusters WHERE is_active=1").fetchone()[0],
-                "total_alleles": conn.execute(
-                    "SELECT COUNT(*) FROM allele_registry WHERE is_active=1").fetchone()[0],
-                "total_constellations": conn.execute(
-                    "SELECT COUNT(*) FROM constellation_registry WHERE is_active=1").fetchone()[0],
-                "total_genotypes": conn.execute("SELECT COUNT(*) FROM genotypes").fetchone()[0],
-                "unresolved_orphans": conn.execute(
-                    "SELECT COUNT(*) FROM orphan_sequences WHERE resolved=0").fetchone()[0],
-                "reassortment_events": conn.execute(
-                    "SELECT COUNT(*) FROM reassortment_events").fetchone()[0],
-            }
 
 
     # ── Allele repair helpers ──────────────────────────────────────────
