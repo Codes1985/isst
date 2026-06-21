@@ -55,7 +55,7 @@ from typing import Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 import numpy as np
 from scipy import stats as scipy_stats
 
-from ..config import ReassortmentConfig, SEGMENTS
+from ..config import ReassortmentConfig, KmerConfig, SEGMENTS
 from .genotype_assigner import GenotypeProfile, ORPHAN_MARKER
 from .kmer_extractor import MinHashSignature
 
@@ -532,9 +532,15 @@ class ReassortmentDetector:
         Full configuration.  All thresholds are read from this object.
     """
 
-    def __init__(self, config: Optional[ReassortmentConfig] = None, db=None):
+    def __init__(
+        self,
+        config: Optional[ReassortmentConfig] = None,
+        db=None,
+        kmer_config: Optional[KmerConfig] = None,
+    ):
         self.config = config or ReassortmentConfig()
         self._db = db  # Optional DatabaseManager for lineage lookups
+        self._kmer_config = kmer_config or KmerConfig()
 
         # Stage 1
         self._alpha = self.config.significance_level
@@ -565,6 +571,24 @@ class ReassortmentDetector:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _segment_distance(
+        self,
+        segment_name: str,
+        sig_a: MinHashSignature,
+        sig_b: MinHashSignature,
+    ) -> float:
+        """Within-clade distance for Stage 2 as a containment-ANI distance
+        (``1 - max-containment-ANI``), using the segment's k-mer length.
+
+        Containment makes the distance length-tolerant: a truncated-but-identical
+        segment reads as near-zero distance rather than an artefactual outlier,
+        so short segments no longer produce false within-clade reassortment
+        signals. For complete, equal-length segments it is a monotonic transform
+        of Jaccard distance, so z-score behaviour is preserved.
+        """
+        k = self._kmer_config.get_k(segment_name)
+        return 1.0 - MinHashSignature.containment_ani(sig_a, sig_b, k)
 
     def detect_reassortments(
         self,
@@ -1250,7 +1274,7 @@ class ReassortmentDetector:
                 sigs_j = signatures.get(ids[j], {})
                 for seg in SEGMENTS:
                     if seg in sigs_i and seg in sigs_j:
-                        d = _jaccard_distance(sigs_i[seg], sigs_j[seg])
+                        d = self._segment_distance(seg, sigs_i[seg], sigs_j[seg])
                         seg_distances[seg].append(d)
 
         baselines: Dict[str, Tuple[float, float]] = {}
@@ -1289,7 +1313,7 @@ class ReassortmentDetector:
             pairs = [pairs[int(c)] for c in chosen]
 
         dists = [
-            _jaccard_distance(signatures[ids[i]][seg], signatures[ids[j]][seg])
+            self._segment_distance(seg, signatures[ids[i]][seg], signatures[ids[j]][seg])
             for i, j in pairs
         ]
         return (
@@ -1335,7 +1359,7 @@ class ReassortmentDetector:
                 mate_sigs = signatures.get(mid, {})
                 if seg in mate_sigs:
                     distances.append(
-                        _jaccard_distance(my_sigs[seg], mate_sigs[seg])
+                        self._segment_distance(seg, my_sigs[seg], mate_sigs[seg])
                     )
 
             if len(distances) < self.min_segment_comparisons:

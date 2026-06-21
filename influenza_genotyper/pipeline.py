@@ -49,7 +49,9 @@ class GenotypingPipeline:
         self.extractor = KmerExtractor(self.config.kmer)
         self.clusterer = ClusteringEngine(self.config.clustering, self.config.kmer)
         self.assigner = GenotypeAssigner()
-        self.reassortment = ReassortmentDetector(self.config.reassortment, db=self.db)
+        self.reassortment = ReassortmentDetector(
+            self.config.reassortment, db=self.db, kmer_config=self.config.kmer
+        )
         self.nomenclature = NomenclatureManager(
             db=self.db,
             clustering_config=self.config.clustering,
@@ -864,6 +866,19 @@ class GenotypingPipeline:
         return self.reassortment.validate_events(
             report.events, genotypes, n_permutations, seed
         )
+
+    # ------------------------------------------------------------------
+    # Orphan reporting
+    # ------------------------------------------------------------------
+
+    def orphan_report(self, cluster_version: Optional[str] = None, limit: int = 20) -> Dict:
+        """Build the read-only orphan report from the ledger (no side effects).
+
+        Pass the active ``cluster_version`` to window the snapshot panels to the
+        current clustering; history panels always span versions.
+        """
+        from .core.orphan_report import OrphanReporter
+        return OrphanReporter(self.db).build(cluster_version, limit=limit)
 
     # ------------------------------------------------------------------
     # Summary
