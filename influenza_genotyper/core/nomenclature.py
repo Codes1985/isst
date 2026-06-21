@@ -323,8 +323,16 @@ class NomenclatureManager:
         internal_cluster_id: str,
         cluster_version: Optional[str] = None,
         centroid_signature: Optional[MinHashSignature] = None,
-    ) -> str:
+        cross_subtype_only: bool = False,
+    ) -> Optional[str]:
         """Get or create a stable allele name for a cluster.
+
+        When ``cross_subtype_only`` is True (used for cluster-orphan segments),
+        only the Stage 2b cross-subtype search runs: a same-subtype match
+        (Stage 2a) and minting (Stage 3) are both skipped, and ``None`` is
+        returned when no cross-subtype donor match is found. This is what names
+        a reassorted orphan segment under its donor subtype while leaving a
+        genuinely novel orphan unnamed (``"?"``) to await a re-clustering.
 
         Lookup order
         ------------
@@ -382,10 +390,12 @@ class NomenclatureManager:
             )
             k = self._kmer_config.get_k(segment_name)
 
-            # 2a: same-subtype index first (most common case, fast path)
+            # 2a: same-subtype index first (most common case, fast path).
+            # Skipped in cross_subtype_only mode (orphan naming), where only a
+            # cross-subtype donor match should ever produce a name.
             same_idx_key = (segment_name, snum)
             same_index = self._centroid_indices.get(same_idx_key)
-            if same_index is not None and len(same_index) > 0:
+            if not cross_subtype_only and same_index is not None and len(same_index) > 0:
                 matched_name = same_index.best_match(centroid_signature, threshold, k)
                 if matched_name is not None:
                     self._allele_cache[key] = matched_name
@@ -448,6 +458,12 @@ class NomenclatureManager:
                     f"will be minted even if this lineage already has one. "
                     f"Pass centroid_signature to ensure naming stability."
                 )
+
+        # Cross-subtype-only mode (orphan naming): never mint. A segment with no
+        # cross-subtype donor match stays unnamed ("?") and waits for a future
+        # re-clustering to resolve it through the orphan lifecycle.
+        if cross_subtype_only:
+            return None
 
         # ── Stage 3: mint a new allele name ─────────────────────────────────
         if self.db:
@@ -738,6 +754,7 @@ class NomenclatureManager:
                     allele = self.assign_allele(
                         seg, st, orphan_cid, cluster_version,
                         centroid_signature=sig,
+                        cross_subtype_only=True,
                     )
                     allele_results[seq_id][seg] = allele
                     logger.debug(

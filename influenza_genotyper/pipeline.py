@@ -195,6 +195,7 @@ class GenotypingPipeline:
         all_assignments: Dict[str, Dict[str, ClusterAssignment]],
         cluster_version: str,
         all_cluster_defs: Optional[Dict[str, Dict[str, "ClusterDefinition"]]] = None,
+        all_signatures: Optional[Dict[str, Dict[str, MinHashSignature]]] = None,
     ):
         """Run naming and genotype profile construction, write results to DB.
 
@@ -218,13 +219,15 @@ class GenotypingPipeline:
                 for seg, a in seg_assignments.items()
             }
 
-        # Build centroid signature map: sequence_id -> segment -> centroid sig
-        # This allows NomenclatureManager Stage 2 to match new cluster IDs to
-        # existing allele names by centroid similarity rather than by ID string.
+        # Build centroid signature map: sequence_id -> segment -> signature.
+        # Clustered segments contribute their cluster centroid (so Stage 2 can
+        # match a new internal cluster id to an existing allele). Cluster-orphan
+        # segments contribute the sequence's OWN signature, so nomenclature Pass 2
+        # can run the cross-subtype (Stage 2b) search that names a reassorted
+        # segment under its donor subtype — the discordance Stage 0 reads.
         centroid_sig_map: Dict[str, Dict[str, MinHashSignature]] = {}
+        centroid_lookup: Dict[Tuple[str, str, str], MinHashSignature] = {}
         if all_cluster_defs is not None:
-            # Build lookup: (subtype, segment, cluster_id) -> centroid signature
-            centroid_lookup: Dict[Tuple[str, str, str], MinHashSignature] = {}
             for st, seg_results in all_cluster_defs.items():
                 for seg, cluster_list in seg_results.items():
                     for cdef in cluster_list:
@@ -233,16 +236,22 @@ class GenotypingPipeline:
                                 cdef.centroid_signature
                             )
 
-            for rec in records:
-                st = rec.subtype
-                seq_sigs: Dict[str, MinHashSignature] = {}
-                for seg, a in all_assignments.get(rec.sequence_id, {}).items():
-                    if not a.is_orphan and a.cluster_id:
-                        sig = centroid_lookup.get((st, seg, a.cluster_id))
-                        if sig is not None:
-                            seq_sigs[seg] = sig
-                if seq_sigs:
-                    centroid_sig_map[rec.sequence_id] = seq_sigs
+        for rec in records:
+            st = rec.subtype
+            own_sigs = (all_signatures or {}).get(rec.sequence_id, {})
+            seq_sigs: Dict[str, MinHashSignature] = {}
+            for seg, a in all_assignments.get(rec.sequence_id, {}).items():
+                if not a.is_orphan and a.cluster_id:
+                    sig = centroid_lookup.get((st, seg, a.cluster_id))
+                    if sig is not None:
+                        seq_sigs[seg] = sig
+                else:
+                    # cluster-orphan: pass the sequence's own segment signature
+                    own = own_sigs.get(seg)
+                    if own is not None:
+                        seq_sigs[seg] = own
+            if seq_sigs:
+                centroid_sig_map[rec.sequence_id] = seq_sigs
 
         naming_results = self.nomenclature.name_genotypes_batch(
             cluster_id_map, subtype_map, cluster_version,
@@ -545,6 +554,7 @@ class GenotypingPipeline:
                 st: {seg: cr.clusters for seg, cr in seg_results.items()}
                 for st, seg_results in all_clustering.items()
             },
+            all_signatures=all_signatures,
         )
         results["genotypes"] = genotypes
         results["nomenclature"] = naming_results
@@ -727,6 +737,7 @@ class GenotypingPipeline:
                 st: seg_clusters
                 for st, seg_clusters in ref_clusters.items()
             },
+            all_signatures=all_signatures,
         )
         results["genotypes"] = genotypes
         results["nomenclature"] = naming_results
