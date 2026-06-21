@@ -113,16 +113,38 @@ class ReassortmentEvent:
 
 @dataclass
 class ReassortmentReport:
-    """Summary of reassortment detection across a dataset."""
+    """Summary of reassortment detection across a dataset.
+
+    Stage 0 (allele-subtype discordance) is deterministic and intra-genome — it
+    does not rely on population statistics — so its hits are reported as a count
+    (``deterministic_flags``), not folded into a rate. ``reassortment_rate`` is
+    the *statistical* rate: Stage 1/2 events over the sequences those stages
+    actually screened (``sequences_analyzed``). This keeps numerator and
+    denominator commensurable (a Stage 0 hit on an incomplete genome never sits
+    in the rate's numerator without being in its denominator) and mirrors the
+    Stage-0-primary / Stage-1-supporting design.
+    """
     total_sequences: int
     sequences_analyzed: int
     events: List[ReassortmentEvent]
-    flagged_sequences: int = 0
+    flagged_sequences: int = 0          # total events across all stages
+    deterministic_flags: int = 0        # Stage 0 events (deterministic route)
+
+    @property
+    def statistical_flags(self) -> int:
+        """Events from the statistical stages (Stage 1 + Stage 2)."""
+        return self.flagged_sequences - self.deterministic_flags
 
     @property
     def reassortment_rate(self) -> float:
+        """Statistical-stage flag rate over the screened pool.
+
+        Deliberately excludes Stage 0: that route is deterministic and is
+        reported via ``deterministic_flags``. Returns 0.0 when no sequences were
+        statistically screened (e.g. n<2, or all flagged by Stage 0).
+        """
         return (
-            self.flagged_sequences / self.sequences_analyzed
+            self.statistical_flags / self.sequences_analyzed
             if self.sequences_analyzed
             else 0.0
         )
@@ -739,10 +761,15 @@ class ReassortmentDetector:
             When provided, enables Stage 0 allele subtype discordance detection,
             which catches cross-subtype reassortment in fully- or partially-
             orphaned isolates that Stage 1 would miss entirely.
-        """
-        if len(profiles) < 2:
-            return ReassortmentReport(len(profiles), 0, [])
 
+        Notes
+        -----
+        Stage 0 is intra-genome and deterministic; it runs for any non-empty
+        input, including a single sequence. The population-relative stages
+        (1 and 2) require at least two representatives in the statistical pool
+        and are skipped below that — but they are *gated*, not the whole
+        function, so an obvious single-genome reassortant is still flagged.
+        """
         # ── Dereplication (pre-count) ────────────────────────────────────────
         # Collapse near-identical genomes so outbreak duplicates do not bias the
         # LD counts (Stage 1) or the within-constellation baselines (Stage 2),
@@ -807,21 +834,32 @@ class ReassortmentDetector:
             p for p in analyzable if p.sequence_id not in stage0_seq_ids
         ]
 
-        # ── Stage 1: LD-based discordance (combination + population FDR) ─────
-        stage1_events, stage1_clear = self._run_stage1(stage1_pool)
-
-        # ── Stage 2: within-cluster distance refinement ──────────────────────
+        # ── Stages 1 & 2: population-relative, need a comparison pool ─────────
+        # These are gated (not the whole function): with fewer than two
+        # representatives to compare, Fisher's exact and the distance baseline
+        # have nothing to test against. Stage 0 has already run above.
+        stage1_events: Dict[str, ReassortmentEvent] = {}
         stage2_events: Dict[str, ReassortmentEvent] = {}
-        if signatures is None:
-            logger.debug("Stage 2 skipped: no MinHash signatures provided")
-        elif not stage1_clear:
+        if len(stage1_pool) < 2:
             logger.debug(
-                "Stage 2 skipped: no profiles passed Stage 1 screening"
+                "Stages 1-2 skipped: statistical pool has %d representative(s) "
+                "(need >= 2)", len(stage1_pool)
             )
         else:
-            stage2_events = self._distance_refinement(
-                stage1_clear, stage1_pool, signatures
-            )
+            # ── Stage 1: LD-based discordance (combination + population FDR) ──
+            stage1_events, stage1_clear = self._run_stage1(stage1_pool)
+
+            # ── Stage 2: within-cluster distance refinement ──────────────────
+            if signatures is None:
+                logger.debug("Stage 2 skipped: no MinHash signatures provided")
+            elif not stage1_clear:
+                logger.debug(
+                    "Stage 2 skipped: no profiles passed Stage 1 screening"
+                )
+            else:
+                stage2_events = self._distance_refinement(
+                    stage1_clear, stage1_pool, signatures
+                )
 
         all_events = (
             list(stage0_events.values())
@@ -833,15 +871,28 @@ class ReassortmentDetector:
         for ev in all_events:
             ev.represented_ids = members.get(ev.sequence_id, [ev.sequence_id])
             ev.represented_count = len(ev.represented_ids)
+        # Option B reporting: Stage 0 (deterministic) counted on its own; the
+        # rate denominator is the pool the statistical stages actually screened.
         report = ReassortmentReport(
-            len(profiles), len(analyzable), all_events, len(all_events)
+            total_sequences=len(profiles),
+            sequences_analyzed=len(stage1_pool),
+            events=all_events,
+            flagged_sequences=len(all_events),
+            deterministic_flags=len(stage0_events),
         )
+        if report.sequences_analyzed:
+            stat_str = (
+                f"{report.reassortment_rate:.1%} of "
+                f"{report.sequences_analyzed} screened"
+            )
+        else:
+            stat_str = "statistical screening n/a (0 screened)"
         logger.info(
-            f"Reassortment: {report.flagged_sequences} event(s) "
-            f"({report.reassortment_rate:.1%} of analyzable) — "
-            f"{len(stage0_events)} from Stage 0, "
-            f"{len(stage1_events)} from Stage 1, "
-            f"{len(stage2_events)} from Stage 2"
+            f"Reassortment: {report.flagged_sequences} event(s) total — "
+            f"{report.deterministic_flags} deterministic (Stage 0), "
+            f"{report.statistical_flags} statistical "
+            f"(Stage 1: {len(stage1_events)}, Stage 2: {len(stage2_events)}); "
+            f"{stat_str}"
         )
         return report
 
@@ -890,10 +941,12 @@ class ReassortmentDetector:
                 f"event(s); {len(kept)} event(s) retained"
             )
         return ReassortmentReport(
-            report.total_sequences,
-            report.sequences_analyzed,
-            kept,
-            len(kept),
+            total_sequences=report.total_sequences,
+            sequences_analyzed=report.sequences_analyzed,
+            events=kept,
+            flagged_sequences=len(kept),
+            # Gating only removes Stage 1 events; the Stage 0 count is unchanged.
+            deterministic_flags=report.deterministic_flags,
         )
 
     def validate_events(
