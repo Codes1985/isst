@@ -105,6 +105,10 @@ class ReassortmentEvent:
     description: str
     detection_stage: int = 1
     evidence: Dict = field(default_factory=dict)
+    # Dereplication: the genomes this event's representative stands for.
+    # Defaults keep single-genome (non-dereplicated) behaviour unchanged.
+    represented_ids: List[str] = field(default_factory=list)
+    represented_count: int = 1
 
 
 @dataclass
@@ -147,6 +151,31 @@ def _sorted_pair(a: str, b: str) -> Tuple[str, str]:
 def _is_assigned(cluster_id: Optional[str]) -> bool:
     """Check if a cluster ID represents a valid assignment (not orphan/missing)."""
     return bool(cluster_id) and cluster_id != ORPHAN_MARKER
+
+
+class _UnionFind:
+    """Minimal union-find for single-linkage grouping of near-identical genomes.
+
+    An outbreak is a chain of near-identical copies (A~B~C); single linkage is
+    the right model, and the chaining that usually worries single linkage is
+    bounded here because the merge predicate is deliberately strict.
+    """
+
+    def __init__(self, ids):
+        self._parent = {i: i for i in ids}
+
+    def find(self, x):
+        root = x
+        while self._parent[root] != root:
+            root = self._parent[root]
+        while self._parent[x] != root:  # path compression
+            self._parent[x], x = root, self._parent[x]
+        return root
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._parent[rb] = ra
 
 
 def _classify_event_type(discordant: List[str]) -> str:
@@ -578,6 +607,116 @@ class ReassortmentDetector:
         k = self._kmer_config.get_k(segment_name)
         return 1.0 - MinHashSignature.containment_ani(sig_a, sig_b, k)
 
+    # ------------------------------------------------------------------
+    # Dereplication (pre-count): collapse near-identical genomes
+    # ------------------------------------------------------------------
+
+    def _same_copy(
+        self,
+        sigs_a: Dict[str, MinHashSignature],
+        sigs_b: Dict[str, MinHashSignature],
+        thresholds: Dict[str, float],
+    ) -> bool:
+        """True iff two genomes are near-identical genome-wide — one virus copied.
+
+        Requires agreement on every *comparable* segment and at least
+        ``min_shared_segments`` comparable-and-matching. A segment present in
+        both, of comparable size, but below its threshold is a real
+        disagreement and disqualifies the pair (short-circuit). A segment that
+        is absent in one genome, or whose two k-mer sets differ too much in size
+        to trust a containment match, is skipped — it cannot be judged either
+        way. Reassortants are kept distinct by this conjunction (and, upstream,
+        by constellation bucketing).
+        """
+        cfg = self.config.dereplication
+        shared = 0
+        for seg in SEGMENTS:
+            x = sigs_a.get(seg)
+            y = sigs_b.get(seg)
+            if x is None or y is None:
+                continue  # absent in one genome — no information
+            na, nb = x.unique_kmer_count, y.unique_kmer_count
+            if na == 0 or nb == 0:
+                continue
+            if min(na, nb) / max(na, nb) < cfg.min_kmer_ratio:
+                continue  # length-mismatched — containment untrustworthy, skip
+            k = self._kmer_config.get_k(seg)
+            if MinHashSignature.containment_ani(x, y, k) < thresholds.get(seg, 1.0):
+                return False  # comparable but over the line — not the same copy
+            shared += 1
+        return shared >= cfg.min_shared_segments
+
+    def dereplicate(
+        self,
+        profiles: List[GenotypeProfile],
+        signatures: Optional[Dict[str, Dict[str, MinHashSignature]]],
+    ) -> Tuple[List[GenotypeProfile], Dict[str, List[str]]]:
+        """Collapse near-identical genomes to one representative each.
+
+        Returns ``(representatives, members)`` where ``members`` maps each
+        representative's sequence_id to every sequence_id it stands for
+        (including itself). When dereplication is disabled, unresolved, or
+        signatures are unavailable, this is the identity map, so callers may use
+        it unconditionally.
+        """
+        cfg = self.config.dereplication
+        identity = {p.sequence_id: [p.sequence_id] for p in profiles}
+        if not cfg.enabled or signatures is None:
+            return profiles, identity
+        thresholds = cfg.segment_ani
+        if not thresholds:
+            logger.debug(
+                "Dereplication enabled but no per-segment thresholds resolved "
+                "(use DereplicationConfig.from_clustering); skipping"
+            )
+            return profiles, identity
+
+        # Coarse filter: bucket by constellation. Two genomes in different
+        # clusters on any segment cannot be the same copy (the derep threshold
+        # is tighter than the same-cluster threshold), so only genomes sharing a
+        # constellation can possibly merge — this also isolates reassortants.
+        buckets: Dict[Tuple, List[GenotypeProfile]] = defaultdict(list)
+        for p in profiles:
+            buckets[tuple(p.segment_clusters.get(s) for s in SEGMENTS)].append(p)
+
+        # Fine filter: single-linkage on the sequence-level predicate, within bucket.
+        uf = _UnionFind([p.sequence_id for p in profiles])
+        for group in buckets.values():
+            if len(group) < 2:
+                continue
+            for i in range(len(group)):
+                a = group[i].sequence_id
+                for j in range(i + 1, len(group)):
+                    b = group[j].sequence_id
+                    if uf.find(a) == uf.find(b):
+                        continue
+                    if self._same_copy(
+                        signatures.get(a, {}), signatures.get(b, {}), thresholds
+                    ):
+                        uf.union(a, b)
+
+        groups: Dict[str, List[str]] = defaultdict(list)
+        for p in profiles:
+            groups[uf.find(p.sequence_id)].append(p.sequence_id)
+
+        by_id = {p.sequence_id: p for p in profiles}
+        reps: List[GenotypeProfile] = []
+        members: Dict[str, List[str]] = {}
+        for ids in groups.values():
+            # representative = most complete genome; tie-break by id for determinism
+            rep_id = max(ids, key=lambda i: (by_id[i].completeness, i))
+            reps.append(by_id[rep_id])
+            members[rep_id] = sorted(ids)
+        reps.sort(key=lambda p: p.sequence_id)
+
+        collapsed = len(profiles) - len(reps)
+        if collapsed > 0:
+            logger.info(
+                f"Dereplication: {len(profiles)} profiles -> {len(reps)} "
+                f"representatives ({collapsed} near-identical collapsed)"
+            )
+        return reps, members
+
     def detect_reassortments(
         self,
         profiles: List[GenotypeProfile],
@@ -604,10 +743,18 @@ class ReassortmentDetector:
         if len(profiles) < 2:
             return ReassortmentReport(len(profiles), 0, [])
 
-        # All profiles are candidates for Stage 0; Stages 1+2 use completeness gate
-        analyzable = [p for p in profiles if p.completeness >= 0.75]
+        # ── Dereplication (pre-count) ────────────────────────────────────────
+        # Collapse near-identical genomes so outbreak duplicates do not bias the
+        # LD counts (Stage 1) or the within-constellation baselines (Stage 2),
+        # nor clutter the report. All stages run on representatives; each event
+        # is expanded back to the genomes it stands for before returning.
+        reps, members = self.dereplicate(profiles, signatures)
+
+        # All representatives are Stage 0 candidates; Stages 1+2 use completeness gate
+        analyzable = [p for p in reps if p.completeness >= 0.75]
         logger.info(
-            f"Analyzing {len(profiles)} profiles for reassortment "
+            f"Analyzing {len(reps)} representatives (from {len(profiles)} "
+            f"profiles) for reassortment "
             f"(Stage 0: {'enabled' if nomenclature else 'disabled'}, "
             f"Stage 1/2 pool: {len(analyzable)}, "
             f"alpha={self._alpha}, bonferroni={self.bonferroni})"
@@ -618,7 +765,7 @@ class ReassortmentDetector:
         stage0_seq_ids: set = set()
 
         if nomenclature is not None:
-            for profile in profiles:
+            for profile in reps:
                 allele_map = (
                     nomenclature.get(profile.sequence_id, {}).get("alleles") or {}
                 )
@@ -681,6 +828,11 @@ class ReassortmentDetector:
             + list(stage1_events.values())
             + list(stage2_events.values())
         )
+        # Expand each event to the genomes its representative stands for, so an
+        # outbreak reports as one event with a count rather than N duplicates.
+        for ev in all_events:
+            ev.represented_ids = members.get(ev.sequence_id, [ev.sequence_id])
+            ev.represented_count = len(ev.represented_ids)
         report = ReassortmentReport(
             len(profiles), len(analyzable), all_events, len(all_events)
         )
@@ -717,8 +869,11 @@ class ReassortmentDetector:
         if not stage1:
             return report
 
+        # Validate against the same representative set the screening used, so the
+        # permutation null is built from independent lineages (not outbreak copies).
+        reps, _ = self.dereplicate(profiles, signatures)
         results = self.validate_events(
-            stage1, profiles,
+            stage1, reps,
             n_permutations=getattr(self.config, "permutation_n", 1000),
             seed=getattr(self.config, "permutation_seed", 42),
         )

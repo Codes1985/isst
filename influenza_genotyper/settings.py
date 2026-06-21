@@ -201,6 +201,74 @@ class ClusteringConfig:
 
 
 @dataclass
+class DereplicationConfig:
+    """Collapse near-identical genomes to one representative before the
+    reassortment counts are built.
+
+    Outbreak samples are near-identical copies of a single virus.  Counted as
+    independent observations they inflate apparent linkage (pseudoreplication),
+    biasing the Stage 1 LD test and the Stage 2 within-constellation baselines,
+    and they clutter the report with duplicate calls.  Dereplication thins each
+    near-identical group to a single representative before any counting; events
+    are expanded back to the genomes they stand for afterwards.
+
+    Two genomes are treated as the same copy only when they agree on *every*
+    comparable segment simultaneously (the all-segments conjunction), so a
+    reassortant — distinct on its donor segment(s) — is never collapsed into a
+    lineage it only partly resembles.
+
+    Attributes
+    ----------
+    enabled : bool
+        Master switch.  When True but no per-segment thresholds are resolved
+        (``segment_ani`` is None — see ``from_clustering``), dereplication is
+        skipped and every genome is its own representative.
+    margin : float
+        Used by ``from_clustering`` to place each per-segment threshold in the
+        band between the same-cluster ANI and 1.0:
+        ``derep = same + margin * (1 - same)``.  A derep match is therefore
+        strictly tighter than "same clade".
+    segment_ani : dict, optional
+        Per-segment ANI above which two segments count as identical.  Populate
+        via ``from_clustering`` (anchored to the clustering thresholds) or set
+        explicitly.  None ⇒ dereplication inert.
+    min_kmer_ratio : float
+        Partial-segment guard.  Containment-ANI over-reads when one segment is
+        a truncated subset, so a segment is only *judged* when its two k-mer
+        sets are comparably sized (``min(|A|,|B|)/max(|A|,|B|) >= ratio``);
+        otherwise it is skipped (cannot be trusted either way).
+    min_shared_segments : int
+        Minimum comparable-and-matching segments required to collapse a pair.
+    """
+    enabled: bool = True
+    margin: float = 0.5
+    segment_ani: Optional[Dict[str, float]] = None
+    min_kmer_ratio: float = 0.85
+    min_shared_segments: int = 6
+
+    @classmethod
+    def from_clustering(
+        cls, clustering: "ClusteringConfig", margin: float = 0.5, **kwargs
+    ) -> "DereplicationConfig":
+        """Build a config whose per-segment thresholds are anchored above each
+        segment's same-cluster ANI: ``derep = same + margin * (1 - same)``.
+
+        This keeps dereplication strictly tighter than the clustering that
+        produced the constellations, and ties it to a single source of truth
+        (the clustering thresholds) rather than a free-floating constant.
+        """
+        seg_ani = {
+            seg: (
+                clustering.get_ani_threshold(seg, subtype="", level="same")
+                + margin
+                * (1.0 - clustering.get_ani_threshold(seg, subtype="", level="same"))
+            )
+            for seg in SEGMENTS
+        }
+        return cls(margin=margin, segment_ani=seg_ani, **kwargs)
+
+
+@dataclass
 class ReassortmentConfig:
     """Configuration for the two-stage reassortment detector.
 
@@ -230,6 +298,9 @@ class ReassortmentConfig:
         discordance_threshold : original heuristic threshold.  Retained for
             config files that still set it; NOT used by the Fisher's test path.
     """
+    # ── Dereplication (pre-count) ─────────────────────────────────────────
+    dereplication: DereplicationConfig = field(default_factory=DereplicationConfig)
+
     # Stage 1
     significance_level: float = 0.05
     bonferroni: bool = True

@@ -11,6 +11,7 @@ from .settings import (  # noqa: F401
     KmerConfig,
     ClusteringConfig,
     ReassortmentConfig,
+    DereplicationConfig,
     DatabaseConfig,
     PerformanceConfig,
     SEGMENTS,

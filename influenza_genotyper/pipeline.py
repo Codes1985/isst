@@ -29,7 +29,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from .config import GenotyperConfig, SEGMENTS
+from .config import GenotyperConfig, DereplicationConfig, SEGMENTS
 from .core import (
     DatabaseManager, SequenceProcessor, KmerExtractor, MinHashSignature,
     ClusteringEngine, ClusteringResult, ClusterAssignment, ClusterDefinition,
@@ -49,6 +49,27 @@ class GenotypingPipeline:
         self.extractor = KmerExtractor(self.config.kmer)
         self.clusterer = ClusteringEngine(self.config.clustering, self.config.kmer)
         self.assigner = GenotypeAssigner()
+
+        # Activate dereplication by anchoring its per-segment thresholds to the
+        # clustering that produces the constellations (single source of truth).
+        # A bare DereplicationConfig leaves segment_ani unset, so we resolve it
+        # here from the clustering thresholds; an explicit override is respected.
+        derep = self.config.reassortment.dereplication
+        if derep.enabled and derep.segment_ani is None:
+            self.config.reassortment.dereplication = (
+                DereplicationConfig.from_clustering(
+                    self.config.clustering,
+                    margin=derep.margin,
+                    enabled=derep.enabled,
+                    min_kmer_ratio=derep.min_kmer_ratio,
+                    min_shared_segments=derep.min_shared_segments,
+                )
+            )
+            logger.info(
+                "Dereplication active (margin=%.2f, anchored to clustering "
+                "same-cluster ANI per segment)",
+                derep.margin,
+            )
         self.reassortment = ReassortmentDetector(
             self.config.reassortment, db=self.db, kmer_config=self.config.kmer
         )
@@ -305,6 +326,13 @@ class GenotypingPipeline:
         )
         for ev in report.events:
             desc = f"[Stage 2] {ev.description}" if ev.detection_stage == 2 else ev.description
+            # Dereplication collapses an outbreak to one representative row; keep
+            # the count visible in the persisted record (no schema change).
+            if ev.represented_count > 1:
+                desc = (
+                    f"{desc} (representative of {ev.represented_count} "
+                    f"near-identical genomes)"
+                )
             self.db.insert_reassortment_event(
                 ev.sequence_id, ev.discordant_segments, ev.confidence, desc
             )
