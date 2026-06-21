@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_genotyper.py — Command-line wrapper for the influenza genotyper pipeline.
+cli.py — Command-line wrapper for the influenza genotyper pipeline.
 
 Subcommands
 -----------
@@ -20,19 +20,19 @@ Typical workflow
 ----------------
 
   # 1. Initial reference run on baseline dataset
-  python run_genotyper.py run sequences_baseline.fasta --mode batch --cluster-version v1
+  run-genotyper run sequences_baseline.fasta --mode batch --cluster-version v1
 
   # 2. Weekly incremental ingestion of new sequences
-  python run_genotyper.py run sequences_week42.fasta --mode incremental
+  run-genotyper run sequences_week42.fasta --mode incremental
 
   # 3. Annual re-clustering when orphan rate is high
-  python run_genotyper.py run sequences_all.fasta --mode recluster
+  run-genotyper run sequences_all.fasta --mode recluster
 
   # 4. Repair a misnamed allele (dry-run first, then commit)
-  python run_genotyper.py repair --segment PB1 --correct-subtype H3N2 \\
+  run-genotyper repair --segment PB1 --correct-subtype H3N2 \\
       --misnamed-allele PB1.1.0002 --cluster-version v1 --dry-run
 
-  python run_genotyper.py repair --segment PB1 --correct-subtype H3N2 \\
+  run-genotyper repair --segment PB1 --correct-subtype H3N2 \\
       --misnamed-allele PB1.1.0002 --cluster-version v1
 """
 
@@ -50,7 +50,7 @@ from pathlib import Path
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="run_genotyper",
+        prog="run-genotyper",
         description="K-mer based genotyping and reassortment detection for influenza whole-genome sequences.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -168,7 +168,7 @@ def _add_repair_parser(sub):
             "Use --dry-run first to confirm which sequences will be affected.\n\n"
             "Example\n"
             "-------\n"
-            "  python run_genotyper.py repair \\\n"
+            "  run-genotyper repair \\\n"
             "      --segment PB1 \\\n"
             "      --correct-subtype H3N2 \\\n"
             "      --misnamed-allele PB1.1.0002 \\\n"
@@ -551,7 +551,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    log = logging.getLogger("run_genotyper")
+    log = logging.getLogger("run-genotyper")
 
     if args.subcommand == "run":
         return cmd_run(args, log)
