@@ -744,6 +744,14 @@ class GenotypingPipeline:
         new_version = f"v{datetime.utcnow().strftime('%Y%m%d')}"
         logger.info(f"Re-clustering run started. New cluster_version: {new_version}")
 
+        # Snapshot resolution context BEFORE re-clustering: the orphan episodes
+        # open under prior versions, and the allele names that already exist.
+        # Both must be captured before run() opens new episodes / mints alleles.
+        open_before = self.db.get_open_orphans()
+        pre_existing_alleles = {
+            row["allele_name"] for row in self.db.load_allele_registry()
+        }
+
         results = self.run(
             fasta_path=fasta_path,
             subtype=subtype,
@@ -769,10 +777,72 @@ class GenotypingPipeline:
             f"Active version is now: {new_version}"
         )
 
+        # Close prior orphan episodes that this recluster resolved.
+        resolution_counts = self._resolve_orphans_after_recluster(
+            open_before, results, pre_existing_alleles
+        )
+
         results["cluster_version"] = new_version
         results["summary"]["mode"] = "recluster"
         results["summary"]["new_cluster_version"] = new_version
+        results["summary"]["orphans_resolved"] = resolution_counts
         return results
+
+    def _resolve_orphans_after_recluster(
+        self,
+        open_episodes: List[Dict],
+        results: Dict,
+        pre_existing_alleles: set,
+    ) -> Dict[str, int]:
+        """Close orphan episodes that the recluster resolved, classifying the door.
+
+        For each episode open before the recluster whose sequence is now
+        clustered (non-orphan) under the new version:
+
+          * ``absorbed`` — it joined an allele that already existed.
+          * ``minted_new`` — a *complete* orphan that is now part of a freshly
+            minted allele (it founded / is the new lineage).
+          * ``resolved_by_completion`` — a *partial* orphan now part of a freshly
+            minted allele (a complete arrived and founded the lineage it joined).
+
+        Sequences not present in this recluster, or still orphan, are left open
+        (a fresh episode is opened for the latter under the new version).
+        Returns counts per door.
+        """
+        assignments = results.get("assignments", {})
+        naming = results.get("nomenclature", {})
+        counts = {"minted_new": 0, "absorbed": 0, "resolved_by_completion": 0}
+
+        with self.db.bulk_operation() as conn:
+            for ep in open_episodes:
+                seq_id = ep["sequence_id"]
+                seg = ep["segment_name"]
+                a = assignments.get(seq_id, {}).get(seg)
+                if a is None or a.is_orphan:
+                    continue  # not reprocessed, or still orphan — leave open
+                allele = naming.get(seq_id, {}).get("alleles", {}).get(seg)
+                if not allele:
+                    continue  # clustered but unnamed — cannot classify; leave open
+                if allele in pre_existing_alleles:
+                    door = "absorbed"
+                elif ep["category"] == "complete":
+                    door = "minted_new"
+                else:
+                    door = "resolved_by_completion"
+                closed = self.db.record_orphan_exit_conn(
+                    conn, seq_id, seg, ep["cluster_version"], door, exit_allele=allele
+                )
+                if closed:
+                    counts[door] += 1
+
+        total = sum(counts.values())
+        if total:
+            logger.info(
+                f"Recluster resolved {total} orphan episode(s): "
+                f"{counts['minted_new']} minted_new, {counts['absorbed']} absorbed, "
+                f"{counts['resolved_by_completion']} resolved_by_completion."
+            )
+        return counts
 
     # ------------------------------------------------------------------
     # Validation

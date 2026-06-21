@@ -369,17 +369,38 @@ class DatabaseManager:
                 "exit_reason must be one of 'minted_new', 'absorbed', "
                 f"'resolved_by_completion', got {exit_reason!r}"
             )
-        now = datetime.utcnow().isoformat()
         with self.connection() as conn:
-            cur = conn.execute(
-                """UPDATE orphan_events
-                       SET exit_reason = ?, exit_allele = ?, exited_at = ?
-                     WHERE sequence_id = ? AND segment_name = ?
-                       AND cluster_version = ? AND exited_at IS NULL""",
-                (exit_reason, exit_allele, now,
-                 sequence_id, segment_name, cluster_version),
+            return self.record_orphan_exit_conn(
+                conn, sequence_id, segment_name, cluster_version,
+                exit_reason, exit_allele,
             )
-            return cur.rowcount > 0
+
+    def record_orphan_exit_conn(
+        self,
+        conn: Any,
+        sequence_id: str,
+        segment_name: str,
+        cluster_version: str,
+        exit_reason: str,
+        exit_allele: Optional[str] = None,
+    ) -> bool:
+        """Connection-bound form of :meth:`record_orphan_exit`, for closing
+        several episodes inside one ``bulk_operation`` transaction."""
+        if exit_reason not in ("minted_new", "absorbed", "resolved_by_completion"):
+            raise ValueError(
+                "exit_reason must be one of 'minted_new', 'absorbed', "
+                f"'resolved_by_completion', got {exit_reason!r}"
+            )
+        now = datetime.utcnow().isoformat()
+        cur = conn.execute(
+            """UPDATE orphan_events
+                   SET exit_reason = ?, exit_allele = ?, exited_at = ?
+                 WHERE sequence_id = ? AND segment_name = ?
+                   AND cluster_version = ? AND exited_at IS NULL""",
+            (exit_reason, exit_allele, now,
+             sequence_id, segment_name, cluster_version),
+        )
+        return cur.rowcount > 0
 
     def count_open_orphans_by_category(
         self, cluster_version: str
