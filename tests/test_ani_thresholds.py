@@ -1,8 +1,8 @@
-"""Tests for Jaccard->ANI threshold conversion and the ANI accessor.
+"""Tests for the Jaccard<->ANI conversion math and the ANI threshold accessor.
 
-The ANI thresholds are a mechanical conversion of the legacy Jaccard thresholds
-(to be tuned later). These tests pin the conversion math, verify the stored
-table matches the formula, and confirm the legacy Jaccard path is untouched.
+The per-segment ANI thresholds are now canonical (set directly per divergence
+rate), not seeded from a Jaccard table. These tests pin the conversion formula
+and the ANI accessor (subtype adjustment + scalar fallback).
 """
 
 import pytest
@@ -11,11 +11,7 @@ from influenza_genotyper.config import (
     ClusteringConfig,
     jaccard_to_ani,
     ani_to_jaccard,
-    SEGMENTS,
 )
-
-SEGMENT_K = {"PB2": 21, "PB1": 21, "PA": 21, "HA": 21,
-             "NP": 19, "NA": 19, "M": 17, "NS": 17}
 
 
 @pytest.mark.parametrize("jaccard", [0.50, 0.80, 0.92, 0.95, 0.98, 0.999])
@@ -42,21 +38,6 @@ def test_conversion_edge_clamps():
     assert ani_to_jaccard(0.0, 21) == 0.0
 
 
-def test_stored_ani_table_matches_formula():
-    """Every stored ANI threshold equals jaccard_to_ani(J, k) of its Jaccard
-    counterpart, to 5 dp — guards against transcription drift."""
-    c = ClusteringConfig()
-    for seg in SEGMENTS:
-        k = SEGMENT_K[seg]
-        for level in ("same", "related"):
-            j = c.segment_thresholds[seg][level]
-            expected = round(jaccard_to_ani(j, k), 5)
-            assert c.segment_ani_thresholds[seg][level] == pytest.approx(expected, abs=1e-5), (
-                f"{seg}/{level}: stored {c.segment_ani_thresholds[seg][level]} "
-                f"!= formula {expected}"
-            )
-
-
 def test_get_ani_threshold_applies_subtype_adjustment():
     c = ClusteringConfig()
     base = c.get_ani_threshold("HA", "H1N1pdm09", "same")
@@ -69,11 +50,3 @@ def test_unknown_segment_falls_back_to_scalar_default():
     c = ClusteringConfig()
     assert c.get_ani_threshold("ZZZ", "H1N1pdm09", "same") == c.same_ani_threshold
     assert c.get_ani_threshold("ZZZ", "H1N1pdm09", "related") == c.related_ani_threshold
-
-
-def test_legacy_jaccard_threshold_unchanged():
-    """The Jaccard accessor must behave exactly as before (still used by the
-    current clustering path)."""
-    c = ClusteringConfig()
-    assert c.get_threshold("HA", "H3N2", "same") == pytest.approx(0.90)   # 0.92 - 0.02
-    assert c.get_threshold("PB2", "H1N1pdm09", "same") == pytest.approx(0.98)

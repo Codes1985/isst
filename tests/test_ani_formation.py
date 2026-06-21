@@ -1,53 +1,18 @@
 """Tests for ANI-driven cluster formation.
 
-Formation now reads the per-segment ANI threshold and converts it to the
-Jaccard cut height the linkage tree is built on. For the zero-adjustment
-subtype this reproduces the legacy Jaccard cut (to table rounding); for H3N2
-the representative ANI subtype adjustment introduces a small, bounded
-difference (the known approximation, to be tuned later).
+Formation reads the per-segment ANI threshold and converts it to the Jaccard
+cut height the linkage tree is built on (via :func:`ani_to_jaccard`). These
+tests exercise that path end-to-end.
 """
 
 import random
 
-import pytest
-
 from influenza_genotyper.config import (
     ClusteringConfig,
     KmerConfig,
-    ani_to_jaccard,
-    SEGMENTS,
 )
 from influenza_genotyper.core.kmer_extractor import KmerExtractor
 from influenza_genotyper.core.clustering_engine import ClusteringEngine
-
-
-def _new_cut(c, kc, seg, st):
-    return 1.0 - ani_to_jaccard(c.get_ani_threshold(seg, st, "same"), kc.get_k(seg))
-
-
-def _old_cut(c, seg, st):
-    return 1.0 - c.get_threshold(seg, st, "same")
-
-
-def test_formation_cut_matches_legacy_for_zero_adjustment_subtype():
-    """H1N1pdm09 has no subtype adjustment, so the ANI-derived cut equals the
-    legacy Jaccard cut up to ANI-table rounding."""
-    c, kc = ClusteringConfig(), KmerConfig()
-    for seg in SEGMENTS:
-        assert _new_cut(c, kc, seg, "H1N1pdm09") == pytest.approx(
-            _old_cut(c, seg, "H1N1pdm09"), abs=5e-4
-        )
-
-
-def test_h3n2_cut_difference_is_small_and_bounded():
-    """The representative-mean H3N2 ANI adjustment differs from the legacy
-    -0.02 Jaccard shift, but only slightly."""
-    c, kc = ClusteringConfig(), KmerConfig()
-    max_diff = max(
-        abs(_new_cut(c, kc, seg, "H3N2") - _old_cut(c, seg, "H3N2"))
-        for seg in SEGMENTS
-    )
-    assert max_diff < 5e-3
 
 
 def _mutate(seq, n, rng):

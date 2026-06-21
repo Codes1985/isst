@@ -34,14 +34,21 @@ def test_margin_knob_removed():
         DereplicationConfig(margin=0.5)
 
 
-def test_validate_flags_looser_than_same_cluster():
-    """The shipped 5-SNV table is looser than the current (tight) clustering on
-    every segment, so the invariant check must report all of them."""
-    violations = DereplicationConfig().validate_against(ClusteringConfig())
+def test_default_table_satisfies_invariant():
+    """With clustering at ~1% (0.989) and derep at ~5 SNVs (>= 0.993 on every
+    segment), the default config satisfies derep >= same-cluster everywhere."""
+    assert DereplicationConfig().validate_against(ClusteringConfig()) == []
+
+
+def test_validate_flags_a_looser_table():
+    """A table deliberately looser than same-cluster is reported on every
+    offending segment (the over-collapse direction)."""
+    loose = DereplicationConfig(segment_ani={seg: 0.95 for seg in SEGMENTS})
+    violations = loose.validate_against(ClusteringConfig())
     flagged = {seg for seg, _d, _s in violations}
     assert flagged == set(SEGMENTS)
     for _seg, derep, same in violations:
-        assert derep < same  # looser = over-collapse direction
+        assert derep < same
 
 
 def test_validate_passes_when_tighter():
