@@ -1,39 +1,107 @@
 # Influenza Genotyper (`isst`)
 
 K-mer based genotyping and reassortment detection for influenza whole-genome
-sequences. Sequences are reduced to per-segment MinHash signatures, clustered
-hierarchically, assigned stable allele and constellation names, and screened
-for reassortment using a staged statistical pipeline.
+sequences. Sequences are reduced to per-segment MinHash signatures, compared by
+**containment-ANI**, clustered hierarchically, assigned stable allele and
+constellation names, and screened for reassortment using a staged statistical
+pipeline. Sequences that cannot yet be placed confidently are tracked through an
+**orphan lifecycle ledger** until a later re-clustering resolves them.
 
 ## How it works
 
 The pipeline takes a FASTA of influenza whole-genome sequences and moves each
 one through these steps:
 
-1. **Parse & validate** — segments are identified from FASTA headers and
-   length-checked, producing one sequence per genome segment.
+1. **Parse, validate & classify completeness** — segments are identified from
+   FASTA headers and length-checked, producing one record per genome segment.
+   Each segment is also assigned a **completeness category** from its length
+   relative to the expected length for that segment:
+   `complete` (at or above the expected minimum), `partial` (present but short),
+   or `no_call` (below half the expected length — too little sequence to trust).
+   This category drives how the segment is routed downstream.
 2. **Extract k-mers** — each segment is broken into overlapping k-mers, with
    `k` chosen per segment (21 for the long segments, down to 17 for the
    shortest). K-mers containing an ambiguous base (`N`) are dropped, and each is
    canonicalized — folded to the smaller of itself and its reverse complement —
    so the result is strand-independent. The unique set of canonical k-mers is
    what carries forward.
-3. **Signature** — that k-mer set is reduced to a fixed-size MinHash signature (1024),
-   hashed with mmh3 (pinned x64 MurmurHash3), which lets later steps estimate
-   Jaccard similarity.
-4. **Cluster** — signatures are clustered hierarchically (scipy), using
-   per-segment and per-subtype similarity thresholds.
-5. **Allele and Constellation Naming** — each segment gets a stable allele name (e.g. `HA.3.0042`) and the
-   genome gets a whole-genome constellation; names persist across re-clustering
-   via centroid matching.
-6. **Detect reassortment** — a three-stage screen flags cross-subtype (e.g., H3N2 and H1N1) allele
-   discordance, then linkage-disequilibrium departures, then within-cluster
-   distance outliers, with optional permutation validation.
+3. **Signature** — that k-mer set is reduced to a fixed-size MinHash signature
+   (1024), hashed with mmh3 (pinned x64 MurmurHash3). Downstream comparison is
+   done in terms of **average nucleotide identity (ANI)**, estimated from MinHash
+   *containment* rather than raw Jaccard. Containment asks "what fraction of the
+   smaller sequence's k-mers appear in the larger?", so a partial or truncated
+   segment that is otherwise a clean subset of a full-length one reads as nearly
+   identical — where symmetric Jaccard would have penalised it purely for being
+   shorter. ANI is the control surface throughout: every threshold below is
+   reasoned and stored as an ANI value (with a per-subtype adjustment) and only
+   converted to the underlying distance at the point of use.
+4. **Cluster** — signatures are clustered hierarchically (scipy), cutting at
+   per-segment, per-subtype thresholds expressed in ANI. Routing depends on
+   completeness: clusters **form from complete segments only**; **partial**
+   segments do not seed or alter cluster definitions but may **join** an existing
+   cluster when their containment-ANI clears the threshold; **no-call** segments
+   are excluded from clustering entirely. This keeps cluster geometry anchored on
+   trustworthy full-length sequence while still letting good partial data be
+   placed.
+5. **Allele and constellation naming** — each segment gets a stable allele name
+   (e.g. `HA.3.0042`) and the genome gets a whole-genome constellation. Names
+   persist across re-clustering via centroid matching, which uses the same
+   containment-ANI metric as acceptance — so the decision to *accept* a sequence
+   into a lineage and the decision to *name* it are driven by a single shared
+   measure and cannot drift apart. A partial segment that is a clean subset of an
+   established lineage is therefore named into that lineage rather than being left
+   unnamed for want of length.
+6. **Detect reassortment** — a three-stage screen flags cross-subtype (e.g.
+   H3N2 and H1N1) allele discordance, then linkage-disequilibrium departures,
+   then within-cluster distance outliers, with optional permutation validation.
+   The distance stage uses containment-ANI distance, so a truncated-but-identical
+   segment no longer registers as a spurious outlier.
 7. **Persist** — sequences, signatures, and genotypes are stored in SQLite,
    supporting incremental ingestion of new sequences against a fixed reference
    clustering. The signature parameters are stamped on first write and validated
    every run, so a mismatch fails loudly rather than silently corrupting results
-   (see [Reproducibility note](#reproducibility-note)).
+   (see [Reproducibility note](#reproducibility-note)). Sequences that cannot be
+   confidently placed are recorded in the orphan lifecycle ledger (see
+   [Orphan lifecycle](#orphan-lifecycle) below).
+
+## Completeness and routing
+
+The completeness category assigned in step 1 is the single knob that decides a
+segment's path:
+
+| Category   | Definition                                  | Clustering role                          |
+| ---------- | ------------------------------------------- | ---------------------------------------- |
+| `complete` | length >= expected minimum for the segment  | seeds and shapes clusters                |
+| `partial`  | between the no-call floor and the minimum   | may join an existing cluster, never forms one |
+| `no_call`  | below half the expected length              | excluded from clustering and naming      |
+
+Because containment-ANI is subset-tolerant, a partial segment is judged on the
+identity of the sequence it *does* have, not penalised for the sequence it is
+missing. The completeness gate and the containment metric work together: the gate
+decides whether a segment is allowed to participate, and containment decides where
+it belongs once it is.
+
+## Orphan lifecycle
+
+A sequence that clears the completeness gate but matches no existing cluster
+closely enough becomes an **orphan**. Rather than being silently dropped, each
+orphan is opened as an episode in a dedicated ledger, capturing the entry context
+(completeness category, the nearest cluster and its distance, and a timestamp).
+An episode stays open — "still waiting" — until a later **re-clustering** places
+the sequence, at which point it is closed with one of three exit reasons:
+
+- `absorbed` — the sequence joined an allele that already existed.
+- `minted_new` — a complete orphan founded a genuinely new allele.
+- `resolved_by_completion` — a partial orphan was resolved into a new allele once
+  enough surrounding data accumulated.
+
+This turns "orphan rate" from an opaque number into an auditable history: you can
+see which sequences are waiting, how long they have waited, what they were near,
+and how past orphans were ultimately resolved. The `OrphanReporter` class (and the
+`GenotypingPipeline.orphan_report(...)` convenience method) assembles this into a
+set of read-only panels — current snapshot, candidate novel lineages, near-misses,
+partial sequences waiting by segment, and resolution outcomes over time — with a
+plain-text renderer for CLI use.
 
 ## Installation
 
@@ -91,7 +159,8 @@ run-genotyper run sequences_all.fasta --mode recluster
 
 Segment identity is inferred from FASTA headers. Outputs are written to
 `--out-dir` as TSV files plus a JSON summary (use `--no-tsv` to print the
-summary only).
+summary only). A `recluster` run additionally reports how many previously-open
+orphan episodes it resolved, broken down by exit reason.
 
 ### Operating modes
 
@@ -99,7 +168,7 @@ summary only).
 | ------------- | --------------------------------------------------------------------------- |
 | `batch`       | Full clustering from scratch. Use for the initial reference run.            |
 | `incremental` | Assigns new sequences to existing clusters without altering definitions.   |
-| `recluster`   | Full re-clustering; retires old clusters and assigns a new dated version.  |
+| `recluster`   | Full re-clustering; retires old clusters, assigns a new dated version, and resolves outstanding orphan episodes. |
 
 ### Repairing a misnamed allele
 
@@ -145,18 +214,22 @@ influenza_genotyper/
 ├── config.py              Re-export shim over settings
 ├── pipeline.py            GenotypingPipeline — end-to-end orchestration
 └── core/
-    ├── sequence_processor.py   FASTA parsing, validation, segment ID
-    ├── kmer_extractor.py       K-mer extraction + MinHash signatures
-    ├── clustering_engine.py    Hierarchical clustering
+    ├── sequence_processor.py   FASTA parsing, validation, completeness, segment ID
+    ├── kmer_extractor.py       K-mer extraction + MinHash signatures + containment-ANI
+    ├── clustering_engine.py    Hierarchical clustering (ANI-thresholded)
     ├── genotype_assigner.py    Composite genotype profiles
     ├── nomenclature.py         Stable allele & constellation naming
     ├── reassortment_detector.py  Three-stage reassortment detection
-    └── database_manager.py     SQLite schema + CRUD
+    ├── orphan_report.py        Read-only orphan lifecycle reporting
+    └── database_manager.py     SQLite schema + CRUD (incl. orphan ledger)
 ```
 
 The `run-genotyper` console command maps to `influenza_genotyper.cli:main`.
 Dependency direction runs strictly downward: the CLI depends on the pipeline,
-the pipeline on the core engines, and the engines on config.
+the pipeline on the core engines, and the engines on config. ANI thresholds and
+the containment metric are defined in `settings.py`/`kmer_extractor.py` and
+shared by clustering, naming, and reassortment detection, so the three never
+diverge on how similarity is measured.
 
 ## Development
 
@@ -168,4 +241,5 @@ ruff check .           # lint
 
 ## License
 
-See [LICENSE](LICENSE). <!-- TODO: confirm license choice -->
+Released under the MIT License — see [LICENSE](LICENSE).
+Copyright (c) 2026 Public Health Agency of Canada.

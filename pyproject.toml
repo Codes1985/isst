@@ -10,10 +10,11 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [
-    { name = "TODO: your name", email = "todo@example.com" },
+    { name = "Public Health Agency of Canada" },
 ]
 keywords = ["influenza", "genotyping", "reassortment", "minhash", "bioinformatics"]
 classifiers = [
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
