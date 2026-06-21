@@ -144,18 +144,6 @@ def _sorted_pair(a: str, b: str) -> Tuple[str, str]:
     return (a, b) if a <= b else (b, a)
 
 
-def _jaccard_distance(sig_a: MinHashSignature, sig_b: MinHashSignature) -> float:
-    """Estimate Jaccard distance from two MinHashSignature objects.
-
-    Uses the .signature attribute (np.ndarray of uint64 hash values).
-    """
-    a = sig_a.signature
-    b = sig_b.signature
-    if len(a) == 0 or len(a) != len(b):
-        return 1.0
-    return 1.0 - float(np.mean(a == b))
-
-
 def _is_assigned(cluster_id: Optional[str]) -> bool:
     """Check if a cluster ID represents a valid assignment (not orphan/missing)."""
     return bool(cluster_id) and cluster_id != ORPHAN_MARKER

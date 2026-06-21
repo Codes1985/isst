@@ -26,7 +26,7 @@ run_recluster(fasta_path, ...)
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from .config import GenotyperConfig, SEGMENTS
@@ -743,7 +743,7 @@ class GenotypingPipeline:
         automatically pick up the new version (as it will be the most recently
         created active version).
         """
-        new_version = f"v{datetime.utcnow().strftime('%Y%m%d')}"
+        new_version = f"v{datetime.now(timezone.utc).strftime('%Y%m%d')}"
         logger.info(f"Re-clustering run started. New cluster_version: {new_version}")
 
         # Snapshot resolution context BEFORE re-clustering: the orphan episodes

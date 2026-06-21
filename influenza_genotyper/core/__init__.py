@@ -10,6 +10,7 @@ from .reassortment_detector import (
     ReassortmentDetector, ReassortmentReport, PermutationResult,
 )
 from .nomenclature import NomenclatureManager
+from .orphan_report import OrphanReporter
 
 __all__ = [
     "DatabaseManager", "SequenceProcessor", "KmerExtractor", "MinHashSignature",
@@ -17,4 +18,5 @@ __all__ = [
     "GenotypeAssigner", "GenotypeProfile",
     "ReassortmentDetector", "ReassortmentReport", "PermutationResult",
     "NomenclatureManager",
+    "OrphanReporter",
 ]

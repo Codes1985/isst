@@ -26,7 +26,7 @@ changes state.
 from __future__ import annotations
 
 import statistics
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 _DOORS = ("minted_new", "absorbed", "resolved_by_completion")
@@ -160,7 +160,7 @@ class OrphanReporter:
         as_of: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         opens = self.db.get_open_orphans(cluster_version)
-        ref = as_of or datetime.utcnow().isoformat()
+        ref = as_of or datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         rows = []
         for o in opens:
             rows.append(

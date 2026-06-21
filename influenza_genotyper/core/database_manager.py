@@ -6,7 +6,7 @@ Supports SQLite (dev) and PostgreSQL (prod).
 import json
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
@@ -14,6 +14,14 @@ from contextlib import contextmanager
 from ..config import DatabaseConfig, SEGMENTS
 
 logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    """UTC timestamp as a naive ISO string (no offset), matching the format used
+    throughout the schema. Replaces the deprecated ``datetime.utcnow()`` while
+    preserving the exact stored format, so timestamp comparisons are unaffected.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 SCHEMA_VERSION = 5
 # v4: signature fingerprint stored in schema_info and enforced on every run.
@@ -235,7 +243,7 @@ class DatabaseManager:
             Path(self.config.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as conn:
             conn.executescript(CREATE_TABLES_SQL)
-            now = datetime.utcnow().isoformat()
+            now = _now_iso()
             self._migrate(conn, now)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_info (key, value, updated_at) VALUES (?, ?, ?)",
@@ -336,7 +344,7 @@ class DatabaseManager:
             raise ValueError(
                 f"orphan category must be 'complete' or 'partial', got {category!r}"
             )
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         conn.execute(
             """INSERT INTO orphan_events
                    (sequence_id, segment_name, cluster_version, category,
@@ -391,7 +399,7 @@ class DatabaseManager:
                 "exit_reason must be one of 'minted_new', 'absorbed', "
                 f"'resolved_by_completion', got {exit_reason!r}"
             )
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         cur = conn.execute(
             """UPDATE orphan_events
                    SET exit_reason = ?, exit_allele = ?, exited_at = ?
@@ -510,7 +518,7 @@ class DatabaseManager:
         """
         incoming = json.dumps(fingerprint, sort_keys=True)
         stored = self.get_signature_fingerprint()
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
 
         if stored is None:
             with self.connection() as conn:
@@ -605,7 +613,7 @@ class DatabaseManager:
     def insert_sequence(self, sequence_id: str, subtype: str,
                         collection_date: Optional[str] = None,
                         metadata: Optional[Dict] = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO sequences
@@ -618,7 +626,7 @@ class DatabaseManager:
                              collection_date: Optional[str] = None,
                              metadata: Optional[Dict] = None) -> None:
         """Bulk-operation variant — uses a caller-supplied connection."""
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         conn.execute(
             """INSERT OR IGNORE INTO sequences
                (sequence_id, collection_date, subtype, metadata_json, created_at, updated_at)
@@ -628,7 +636,7 @@ class DatabaseManager:
 
     def update_sequence_status(self, sequence_id: str, status: str,
                                segments_found: Optional[int] = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             if segments_found is not None:
                 conn.execute("UPDATE sequences SET status=?, segments_found=?, updated_at=? WHERE sequence_id=?",
@@ -640,7 +648,7 @@ class DatabaseManager:
     def update_sequence_status_conn(self, conn: Any, sequence_id: str, status: str,
                                     segments_found: Optional[int] = None) -> None:
         """Bulk-operation variant — uses a caller-supplied connection."""
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         if segments_found is not None:
             conn.execute("UPDATE sequences SET status=?, segments_found=?, updated_at=? WHERE sequence_id=?",
                          (status, segments_found, now, sequence_id))
@@ -666,7 +674,7 @@ class DatabaseManager:
     def insert_segment_kmer(self, sequence_id: str, segment_name: str, k_value: int,
                             kmer_signature: bytes, sequence_length: int,
                             cluster_version: str = "v0") -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO segment_kmers
@@ -679,7 +687,7 @@ class DatabaseManager:
                                  k_value: int, kmer_signature: bytes, sequence_length: int,
                                  cluster_version: str = "v0") -> None:
         """Bulk-operation variant — uses a caller-supplied connection."""
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         conn.execute(
             """INSERT OR REPLACE INTO segment_kmers
                (sequence_id, segment_name, k_value, kmer_signature, sequence_length, cluster_version, created_at)
@@ -730,7 +738,7 @@ class DatabaseManager:
     def insert_cluster(self, cluster_id: str, segment_name: str, subtype: str,
                        centroid_signature: bytes, member_count: int,
                        mean_diameter: float, version: str) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO clusters
@@ -745,7 +753,7 @@ class DatabaseManager:
                             subtype: str, centroid_signature: bytes, member_count: int,
                             mean_diameter: float, version: str) -> None:
         """Bulk-operation variant — uses a caller-supplied connection."""
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         conn.execute(
             """INSERT OR REPLACE INTO clusters
                (cluster_id, segment_name, subtype, centroid_signature,
@@ -794,7 +802,7 @@ class DatabaseManager:
     def update_cluster_member_count(self, cluster_id: str, segment_name: str,
                                     version: str, member_count: int) -> None:
         """Increment the stored member count for a cluster after incremental assignment."""
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """UPDATE clusters SET member_count=?, updated_at=?
@@ -836,7 +844,7 @@ class DatabaseManager:
                       cluster_version: Optional[str] = None,
                       centroid_signature: Optional[bytes] = None,
                       member_count: int = 0) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO allele_registry
@@ -875,7 +883,7 @@ class DatabaseManager:
             return [dict(r) for r in rows]
 
     def update_allele_last_seen(self, allele_name: str, member_count: Optional[int] = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             if member_count is not None:
                 conn.execute("UPDATE allele_registry SET last_seen=?, member_count=? WHERE allele_name=?",
@@ -890,7 +898,7 @@ class DatabaseManager:
                               evidence: str = "cross_subtype_centroid_match") -> None:
         """Record that two allele names refer to the same biological lineage."""
         a, b = sorted([allele_a, allele_b])
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO allele_lineage
@@ -927,7 +935,7 @@ class DatabaseManager:
 
         Returns the number of constellations retired.
         """
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             if containing_allele:
                 rows = conn.execute(
@@ -1021,7 +1029,7 @@ class DatabaseManager:
 
     def insert_constellation(self, constellation_id: str, subtype_short: str,
                              allele_combination: str, member_count: int = 0) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO constellation_registry
@@ -1046,7 +1054,7 @@ class DatabaseManager:
 
     def update_constellation_last_seen(self, constellation_id: str,
                                        member_count: Optional[int] = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             if member_count is not None:
                 conn.execute("UPDATE constellation_registry SET last_seen=?, member_count=? WHERE constellation_id=?",
@@ -1067,7 +1075,7 @@ class DatabaseManager:
                         reassortment_score: float = 0.0,
                         reassortment_flag: bool = False,
                         completeness: float = 1.0) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO genotypes
@@ -1085,7 +1093,7 @@ class DatabaseManager:
                              reassortment_flag: bool = False,
                              completeness: float = 1.0) -> None:
         """Bulk-operation variant — uses a caller-supplied connection."""
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         conn.execute(
             """INSERT OR REPLACE INTO genotypes
                (sequence_id, genotype_profile, allele_profile, constellation_id,
@@ -1112,7 +1120,7 @@ class DatabaseManager:
     def flag_orphan(self, sequence_id: str, segment_name: str,
                     nearest_cluster: Optional[str] = None,
                     nearest_distance: Optional[float] = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO orphan_sequences
@@ -1125,7 +1133,7 @@ class DatabaseManager:
                          nearest_cluster: Optional[str] = None,
                          nearest_distance: Optional[float] = None) -> None:
         """Bulk-operation variant — uses a caller-supplied connection."""
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         conn.execute(
             """INSERT OR REPLACE INTO orphan_sequences
                (sequence_id, segment_name, nearest_cluster, nearest_distance, flagged_at)
@@ -1137,7 +1145,7 @@ class DatabaseManager:
 
     def insert_reassortment_event(self, sequence_id: str, discordant_segments: List[str],
                                   confidence: float, description: Optional[str] = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _now_iso()
         with self.connection() as conn:
             conn.execute(
                 """INSERT INTO reassortment_events
