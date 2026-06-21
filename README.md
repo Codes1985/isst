@@ -36,7 +36,8 @@ one through these steps:
    reasoned and stored as an ANI value (with a per-subtype adjustment) and only
    converted to the underlying distance at the point of use.
 4. **Cluster** — signatures are clustered hierarchically (scipy), cutting at
-   per-segment, per-subtype thresholds expressed in ANI. Routing depends on
+   per-segment, per-subtype thresholds expressed in ANI (set to admit roughly
+   1% within-cluster divergence). Routing depends on
    completeness: clusters **form from complete segments only**; **partial**
    segments do not seed or alter cluster definitions but may **join** an existing
    cluster when their containment-ANI clears the threshold; **no-call** segments
@@ -51,11 +52,17 @@ one through these steps:
    measure and cannot drift apart. A partial segment that is a clean subset of an
    established lineage is therefore named into that lineage rather than being left
    unnamed for want of length.
-6. **Detect reassortment** — a three-stage screen flags cross-subtype (e.g.
-   H3N2 and H1N1) allele discordance, then linkage-disequilibrium departures,
-   then within-cluster distance outliers, with optional permutation validation.
-   The distance stage uses containment-ANI distance, so a truncated-but-identical
-   segment no longer registers as a spurious outlier.
+6. **Dereplicate, then detect reassortment** — near-identical genomes are first
+   collapsed to a single representative each (see [Dereplication](#dereplication)),
+   so an outbreak of duplicate samples cannot inflate the statistics or clutter
+   the output; each flagged event is later expanded back to the genomes it stands
+   for. A three-stage screen then flags cross-subtype (e.g. H3N2 and H1N1) allele
+   discordance, then linkage-disequilibrium departures, then within-cluster
+   distance outliers, with optional permutation validation. The distance stage
+   uses containment-ANI distance, so a truncated-but-identical segment no longer
+   registers as a spurious outlier. Stage 0 is deterministic and runs even for a
+   single genome; its finds are reported as a count, kept separate from the
+   population-statistical rate of the later stages.
 7. **Persist** — sequences, signatures, and genotypes are stored in SQLite,
    supporting incremental ingestion of new sequences against a fixed reference
    clustering. The signature parameters are stamped on first write and validated
@@ -80,6 +87,30 @@ identity of the sequence it *does* have, not penalised for the sequence it is
 missing. The completeness gate and the containment metric work together: the gate
 decides whether a segment is allowed to participate, and containment decides where
 it belongs once it is.
+
+## Dereplication
+
+Surveillance datasets often contain many near-identical genomes — copies of a
+single virus sampled repeatedly through an outbreak. Counted naively, those
+duplicates bias the reassortment statistics (an outbreak of *N* copies votes *N*
+times when it is really one independent observation) and clutter the report with
+*N* duplicate calls. Before any reassortment counting, the detector **collapses**
+each group of near-identical genomes to a single representative.
+
+Two genomes are treated as the same copy only when they agree on **every**
+comparable segment at once — an all-segments conjunction — so a reassortant,
+which differs on its donor segment, is never folded into a lineage it only
+partly resembles. The threshold is a standalone per-segment ANI table, set
+independently of clustering: clustering granularity is a surveillance *policy*
+(how fine a strain to track, ~1% divergence), whereas the dereplication
+threshold is a *measurement* fact (how much divergence still means "one virus,
+sampled twice", ~5 SNVs per segment). The only constraint between them is that
+dereplication must be at least as tight as clustering, which the pipeline
+validates and warns about at startup.
+
+Each reassortment event then carries the count of genomes its representative
+stands for, so one outbreak reports as one event with a multiplicity rather than
+many duplicate rows.
 
 ## Orphan lifecycle
 
@@ -219,7 +250,7 @@ influenza_genotyper/
     ├── clustering_engine.py    Hierarchical clustering (ANI-thresholded)
     ├── genotype_assigner.py    Composite genotype profiles
     ├── nomenclature.py         Stable allele & constellation naming
-    ├── reassortment_detector.py  Three-stage reassortment detection
+    ├── reassortment_detector.py  Dereplication + three-stage reassortment detection
     ├── orphan_report.py        Read-only orphan lifecycle reporting
     └── database_manager.py     SQLite schema + CRUD (incl. orphan ledger)
 ```
