@@ -53,6 +53,7 @@ class GenotypingPipeline:
         self.nomenclature = NomenclatureManager(
             db=self.db,
             clustering_config=self.config.clustering,
+            kmer_config=self.config.kmer,
         )
 
     def initialize(self, allow_param_change: bool = False) -> None:
@@ -873,7 +874,8 @@ class GenotypingPipeline:
         # This forces Stage 2 to either find a legitimate same-subtype centroid
         # or mint a new correctly-named allele.
         repair_nom = NomenclatureManager(
-            db=self.db, clustering_config=self.config.clustering
+            db=self.db, clustering_config=self.config.clustering,
+            kmer_config=self.config.kmer,
         )
         repair_nom.load_from_db()
 

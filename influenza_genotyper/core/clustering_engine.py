@@ -409,25 +409,26 @@ class ClusteringEngine:
         """
 
         if not clusters:
-            # 1.0 is the maximum meaningful Jaccard distance; avoids inf/nan
+            # 1.0 is the maximum meaningful distance; avoids inf/nan
             # propagation if callers naively aggregate distance values.
             return ClusterAssignment(
                 sequence_id, segment_name, None, 1.0, True
             )
 
-        threshold = self.config.get_threshold(segment_name, subtype, "same")
-        distance_threshold = 1.0 - threshold
+        ani_threshold = self.config.get_ani_threshold(segment_name, subtype, "same")
+        k = self.kmer_config.get_k(segment_name)
 
         best_cluster: Optional[ClusterDefinition] = None
-        best_distance = float("inf")
+        best_ani = -1.0
 
         for cluster in clusters:
             if cluster.centroid_signature is None:
                 continue
-            sim = MinHashSignature.jaccard_similarity(signature, cluster.centroid_signature)
-            dist = max(0.0, min(1.0, 1.0 - sim))
-            if dist < best_distance:
-                best_distance, best_cluster = dist, cluster
+            ani = MinHashSignature.containment_ani(
+                signature, cluster.centroid_signature, k
+            )
+            if ani > best_ani:
+                best_ani, best_cluster = ani, cluster
 
         if best_cluster is None:
             # All centroids were None — treat as max distance
@@ -435,7 +436,11 @@ class ClusteringEngine:
                 sequence_id, segment_name, None, 1.0, True
             )
 
-        if best_distance <= distance_threshold:
+        # distance_to_centroid is reported as an ANI distance (1 - ANI) for the
+        # accepted/nearest cluster, consistent with the acceptance metric.
+        best_distance = max(0.0, 1.0 - best_ani)
+
+        if best_ani >= ani_threshold:
             return ClusterAssignment(
                 sequence_id,
                 segment_name,
@@ -483,34 +488,45 @@ class ClusteringEngine:
                 for sid in sequence_ids
             ]
 
-        threshold = self.config.get_threshold(segment_name, subtype, "same")
-        distance_threshold = 1.0 - threshold
+        ani_threshold = self.config.get_ani_threshold(segment_name, subtype, "same")
+        kmer_k = self.kmer_config.get_k(segment_name)
 
-        # Build hash matrices: queries (m, d) and centroids (k, d)
+        # Build hash matrices: queries (m, d) and centroids (n, d), plus the
+        # exact unique-k-mer sizes containment needs.
         query_matrix = _signatures_to_hash_matrix(signatures)
+        query_sizes = np.array(
+            [s.unique_kmer_count for s in signatures], dtype=np.float64
+        )
         centroid_matrix = np.array(
             [c.centroid_signature.signature for c in usable], dtype=np.uint64
+        )
+        centroid_sizes = np.array(
+            [c.centroid_signature.unique_kmer_count for c in usable], dtype=np.float64
         )
         cluster_ids = [c.cluster_id for c in usable]
 
         m = query_matrix.shape[0]
-        k = centroid_matrix.shape[0]
+        n_centroids = centroid_matrix.shape[0]
 
-        # Iterate over centroids (small k), vectorize across queries (large m)
-        dist_matrix = np.empty((m, k), dtype=np.float64)
-        for j in range(k):
-            matches = query_matrix == centroid_matrix[j]  # (m, d)
-            similarities = np.mean(matches, axis=1)       # (m,)
-            dist_matrix[:, j] = np.clip(1.0 - similarities, 0.0, 1.0)
+        # Max-containment-ANI of every query against every centroid. Iterate
+        # centroids (small n), vectorise across queries (large m). Uses the same
+        # shared helper as naming, so acceptance and naming cannot diverge.
+        ani_matrix = np.empty((m, n_centroids), dtype=np.float64)
+        for j in range(n_centroids):
+            jaccard = np.mean(query_matrix == centroid_matrix[j], axis=1)  # (m,)
+            ani_matrix[:, j] = MinHashSignature.max_containment_ani_vec(
+                jaccard, query_sizes, centroid_sizes[j], kmer_k
+            )
 
-        best_indices = np.argmin(dist_matrix, axis=1)
-        best_dists = dist_matrix[np.arange(m), best_indices]
+        best_indices = np.argmax(ani_matrix, axis=1)
+        best_anis = ani_matrix[np.arange(m), best_indices]
 
         assignments: List[ClusterAssignment] = []
         for i, sid in enumerate(sequence_ids):
             bi = int(best_indices[i])
-            bd = float(best_dists[i])
-            if bd <= distance_threshold:
+            ba = float(best_anis[i])
+            bd = max(0.0, 1.0 - ba)   # ANI distance, for reporting
+            if ba >= ani_threshold:
                 assignments.append(
                     ClusterAssignment(sid, segment_name, cluster_ids[bi], bd, False)
                 )

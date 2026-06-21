@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..config import SEGMENTS, ClusteringConfig
+from ..config import SEGMENTS, ClusteringConfig, KmerConfig
 from .kmer_extractor import MinHashSignature
 
 if TYPE_CHECKING:
@@ -125,6 +125,9 @@ class _CentroidIndex:
         self._matrix: Optional[np.ndarray] = None
         # Rows added since last consolidation — avoids per-add vstack cost
         self._pending_rows: List[np.ndarray] = []
+        # Exact unique-k-mer count per centroid, parallel to _names. Needed for
+        # containment (the hash matrix alone yields only Jaccard).
+        self._sizes: List[int] = []
 
     def _consolidate(self) -> None:
         """Merge any pending rows into the consolidated matrix.
@@ -151,6 +154,7 @@ class _CentroidIndex:
         """
         row = signature.signature.astype(np.uint64)  # (d,)
         self._names.append(allele_name)
+        self._sizes.append(int(signature.unique_kmer_count))
         if self._matrix is None:
             # Still in accumulation phase — buffer the row
             self._pending_rows.append(row)
@@ -159,45 +163,53 @@ class _CentroidIndex:
             self._pending_rows.append(row)
             self._consolidate()
 
-    def best_match(
-        self, query: MinHashSignature, threshold: float
-    ) -> Optional[str]:
-        """Return the allele name whose centroid is most similar to *query*,
-        provided that similarity exceeds *threshold*.  Returns None otherwise.
+    def best_match_with_score(
+        self, query: MinHashSignature, threshold: float, k: int
+    ) -> Optional[Tuple[str, float]]:
+        """Return ``(allele_name, containment_ani)`` for the centroid with the
+        highest max-containment-ANI to *query*, provided that ANI meets
+        *threshold*.  Returns None otherwise.
 
-        Uses vectorised broadcasting: computes all Jaccard similarities in a
-        single (N, d) == (1, d) comparison, avoiding Python loops over alleles.
+        Containment (not plain Jaccard) is used so a partial-but-identical
+        segment scores near 1.0 against its full-length lineage centroid instead
+        of being penalised for missing length.  ``k`` is the per-segment k-mer
+        length the signatures were built with.  The metric is computed by the
+        shared :meth:`MinHashSignature.max_containment_ani_vec`, so acceptance
+        and naming cannot diverge.
         """
         if not self._names:
             return None
-
-        # Consolidate any buffered rows before querying
         self._consolidate()
-
         if self._matrix is None:
             return None
 
-        q = query.signature.reshape(1, -1).astype(np.uint64)  # (1, d)
-        # Broadcasting: (N, d) == (1, d) → (N, d) bool
-        matches = self._matrix == q
-        similarities = np.mean(matches, axis=1)                # (N,)
-        best_sim = float(similarities.max())
+        q = query.signature.reshape(1, -1).astype(np.uint64)   # (1, d)
+        jaccard = np.mean(self._matrix == q, axis=1)           # (N,)
+        sizes = np.asarray(self._sizes, dtype=np.float64)       # (N,)
+        ani = MinHashSignature.max_containment_ani_vec(
+            jaccard, query.unique_kmer_count, sizes, k
+        )                                                       # (N,)
 
-        if best_sim < threshold:
+        best_ani = float(ani.max())
+        if best_ani < threshold:
             return None
 
-        # Deterministic tie-break: when several centroids share the maximum
-        # similarity, return the lexicographically smallest allele name rather
-        # than the lowest array index. np.argmax would return the first-inserted
-        # row, making the result depend on insertion order (DB load order, and
-        # any future parallel processing). Allele names are stable and globally
-        # unique, and because they are zero-padded (e.g. PB1.3.0001) the smallest
-        # name is also the lowest allele number — preserving the original
-        # "oldest lineage wins" intent without the order dependence.
-        tied = np.flatnonzero(similarities == best_sim)
+        # Deterministic tie-break: among centroids at the maximum ANI, return the
+        # lexicographically smallest allele name rather than the lowest array
+        # index. Names are zero-padded and globally unique, so the smallest name
+        # is the oldest lineage — order-independent (DB load order, parallelism).
+        tied = np.flatnonzero(ani == best_ani)
         if tied.size == 1:
-            return self._names[int(tied[0])]
-        return min(self._names[int(i)] for i in tied)
+            return self._names[int(tied[0])], best_ani
+        return min(self._names[int(i)] for i in tied), best_ani
+
+    def best_match(
+        self, query: MinHashSignature, threshold: float, k: int
+    ) -> Optional[str]:
+        """Allele name of the best containment-ANI match at/above *threshold*,
+        or None.  Thin wrapper over :meth:`best_match_with_score`."""
+        result = self.best_match_with_score(query, threshold, k)
+        return result[0] if result is not None else None
 
     def __len__(self) -> int:
         return len(self._names)
@@ -228,9 +240,11 @@ class NomenclatureManager:
         self,
         db: Optional["DatabaseManager"] = None,
         clustering_config: Optional[ClusteringConfig] = None,
+        kmer_config: Optional[KmerConfig] = None,
     ):
         self.db = db
         self._clustering_config = clustering_config or ClusteringConfig()
+        self._kmer_config = kmer_config or KmerConfig()
 
         # (seg, snum, cid) -> allele_name — primary lookup by cluster ID
         self._allele_cache: Dict[Tuple[str, int, str], str] = {}
@@ -363,15 +377,16 @@ class NomenclatureManager:
 
         # ── Stage 2: centroid similarity search ─────────────────────────────
         if centroid_signature is not None:
-            threshold = self._clustering_config.get_threshold(
+            threshold = self._clustering_config.get_ani_threshold(
                 segment_name, subtype, "same"
             )
+            k = self._kmer_config.get_k(segment_name)
 
             # 2a: same-subtype index first (most common case, fast path)
             same_idx_key = (segment_name, snum)
             same_index = self._centroid_indices.get(same_idx_key)
             if same_index is not None and len(same_index) > 0:
-                matched_name = same_index.best_match(centroid_signature, threshold)
+                matched_name = same_index.best_match(centroid_signature, threshold, k)
                 if matched_name is not None:
                     self._allele_cache[key] = matched_name
                     if self.db:
@@ -395,15 +410,10 @@ class NomenclatureManager:
                     continue  # already searched above — skip
                 if len(index) == 0:
                     continue
-                matched_name = index.best_match(centroid_signature, threshold)
-                if matched_name is not None:
-                    # Pick the best match across all cross-subtype indices
-                    # (best_match already enforces threshold, so any match is
-                    # valid; we prefer the highest similarity if >1 index hits)
-                    index._consolidate()
-                    q = centroid_signature.signature.reshape(1, -1).astype("uint64")
-                    sims = np.mean(index._matrix == q, axis=1)
-                    sim = float(sims.max())
+                result = index.best_match_with_score(centroid_signature, threshold, k)
+                if result is not None:
+                    matched_name, sim = result
+                    # Prefer the highest-ANI match across cross-subtype indices.
                     if sim > best_cross_sim:
                         best_cross_sim = sim
                         best_cross_name = matched_name
@@ -487,20 +497,18 @@ class NomenclatureManager:
                     continue  # same subtype — not a cross-subtype link
                 if len(index) == 0:
                     continue
-                cross_match = index.best_match(centroid_signature, threshold)
-                if cross_match is not None:
-                    # Compute the actual similarity for the record
-                    index._consolidate()
-                    q = centroid_signature.signature.reshape(1, -1).astype("uint64")
-                    sims = np.mean(index._matrix == q, axis=1)
-                    cross_sim = float(sims.max())
+                cross_result = index.best_match_with_score(
+                    centroid_signature, threshold, k
+                )
+                if cross_result is not None:
+                    cross_match, cross_sim = cross_result
                     self.db.record_allele_lineage(
                         allele_name, cross_match, cross_sim,
                         evidence="cross_subtype_centroid_match_at_mint",
                     )
                     logger.info(
                         f"Allele lineage recorded: {allele_name} ↔ {cross_match} "
-                        f"(sim={cross_sim:.3f}, segment={segment_name})"
+                        f"(ani={cross_sim:.4f}, segment={segment_name})"
                     )
 
         logger.debug(
@@ -796,15 +804,15 @@ class NomenclatureManager:
                             # the allele's own subtype index (where its centroid lives).
                             allele_idx = self._centroid_indices.get((seg, allele_snum))
                             if allele_idx is not None and len(allele_idx) > 0:
-                                threshold = self._clustering_config.get_threshold(
+                                threshold = self._clustering_config.get_ani_threshold(
                                     seg, st, "same"
                                 )
-                                matched = allele_idx.best_match(sig, threshold)
-                                if matched == allele:
-                                    allele_idx._consolidate()
-                                    q = sig.signature.reshape(1, -1).astype("uint64")
-                                    sims = np.mean(allele_idx._matrix == q, axis=1)
-                                    link_sim = float(sims.max())
+                                k = self._kmer_config.get_k(seg)
+                                matched_result = allele_idx.best_match_with_score(
+                                    sig, threshold, k
+                                )
+                                if matched_result is not None and matched_result[0] == allele:
+                                    link_sim = matched_result[1]
                                     # Also check if the declaring subtype index has
                                     # a same-segment allele from a prior run that
                                     # should be linked (the "PB1.1.0002 is also the
@@ -816,7 +824,7 @@ class NomenclatureManager:
                                         (seg, declared_snum)
                                     )
                                     other_match = (
-                                        other_idx.best_match(sig, threshold)
+                                        other_idx.best_match(sig, threshold, k)
                                         if other_idx and len(other_idx) > 0
                                         else None
                                     )

@@ -275,6 +275,127 @@ class MinHashSignature:
             )
         return float(np.sum(sig_a.signature == sig_b.signature)) / sig_a.num_hashes
 
+    # ------------------------------------------------------------------
+    # Containment and ANI
+    # ------------------------------------------------------------------
+    #
+    # Containment is derived from the estimated Jaccard J and the *exact* k-mer
+    # set cardinalities (unique_kmer_count), which are already stored in every
+    # signature — so no extra stored field is needed.
+    #
+    #     |A ∩ B| = J · (|A| + |B|) / (1 + J)
+    #     C(A ⊆ B) = |A ∩ B| / |A|        (directional)
+    #
+    # The only estimation error is in J (kept small by a large num_hashes); the
+    # cardinalities are exact. Containment is robust to length differences: a
+    # short segment that is a clean subset of a longer one approaches C = 1 even
+    # though their Jaccard is depressed by the size gap. That is the property we
+    # want for partial-but-identical segments.
+
+    @staticmethod
+    def containment(
+        sig_a: "MinHashSignature", sig_b: "MinHashSignature"
+    ) -> Tuple[float, float]:
+        """Return directional containment ``(C(A⊆B), C(B⊆A))`` in [0, 1].
+
+        ``C(A⊆B)`` is the fraction of A's k-mers also present in B. Returns
+        ``(0.0, 0.0)`` when either set is empty or the estimated intersection
+        is zero. Reuses ``jaccard_similarity`` (so the same comparability guard
+        applies).
+        """
+        a = sig_a.unique_kmer_count
+        b = sig_b.unique_kmer_count
+        if a == 0 or b == 0:
+            return 0.0, 0.0
+        j = MinHashSignature.jaccard_similarity(sig_a, sig_b)
+        if j <= 0.0:
+            return 0.0, 0.0
+        inter = j * (a + b) / (1.0 + j)
+        c_a = min(inter / a, 1.0)
+        c_b = min(inter / b, 1.0)
+        return c_a, c_b
+
+    @staticmethod
+    def max_containment(
+        sig_a: "MinHashSignature", sig_b: "MinHashSignature"
+    ) -> float:
+        """Larger of the two directional containments.
+
+        This is the quantity to threshold against: it asks "is the smaller set
+        a clean subset of the larger?", which is exactly what makes a
+        truncated-but-identical segment score near 1.0.
+        """
+        c_a, c_b = MinHashSignature.containment(sig_a, sig_b)
+        return max(c_a, c_b)
+
+    @staticmethod
+    def containment_ani(
+        sig_a: "MinHashSignature", sig_b: "MinHashSignature", k: int
+    ) -> float:
+        """Estimate average nucleotide identity from max-containment.
+
+        Under a simple substitution model the probability a k-mer is shared is
+        ~ANI**k, so ANI ≈ C**(1/k). Using *max*-containment means a partial
+        segment that is a perfect subset of its full-length counterpart returns
+        ~1.0 rather than being penalised for missing length (which is what plain
+        Jaccard-based ANI would do). ``k`` is the k-mer length the signatures
+        were built with (per-segment); it is not stored in the signature, so the
+        caller supplies it.
+        """
+        if k <= 0:
+            raise ValueError("k must be a positive integer")
+        c = MinHashSignature.max_containment(sig_a, sig_b)
+        if c <= 0.0:
+            return 0.0
+        return float(c ** (1.0 / k))
+
+    @staticmethod
+    def jaccard_ani(
+        sig_a: "MinHashSignature", sig_b: "MinHashSignature", k: int
+    ) -> float:
+        """Estimate ANI from Jaccard via the Mash distance: ``1 + (1/k)·ln(2J/(1+J))``.
+
+        Provided for comparison/validation. For complete, equal-length segments
+        it agrees with :meth:`containment_ani`; it *under*-estimates when the two
+        segments differ in length, which is the failure mode containment avoids.
+        """
+        if k <= 0:
+            raise ValueError("k must be a positive integer")
+        j = MinHashSignature.jaccard_similarity(sig_a, sig_b)
+        if j <= 0.0:
+            return 0.0
+        d = -(1.0 / k) * float(np.log(2.0 * j / (1.0 + j)))
+        return max(0.0, 1.0 - d)
+
+    @staticmethod
+    def max_containment_ani_vec(
+        jaccard, size_a, size_b, k: int
+    ) -> "np.ndarray":
+        """Vectorised max-containment-ANI from estimated Jaccard and exact sizes.
+
+        The numpy-broadcast equivalent of :meth:`containment_ani`: it is the
+        single source of truth shared by cluster acceptance (engine) and allele
+        naming (centroid index), so the two cannot drift. ``jaccard`` and the
+        sizes broadcast against each other (e.g. one query vs N centroids, or M
+        queries vs one centroid). Returns 0 where either set is empty or the
+        estimated intersection is zero.
+
+            |A ∩ B| = J·(|A|+|B|)/(1+J);  C = max(|A∩B|/|A|, |A∩B|/|B|);  ANI = C**(1/k)
+        """
+        if k <= 0:
+            raise ValueError("k must be a positive integer")
+        j = np.asarray(jaccard, dtype=np.float64)
+        sa = np.asarray(size_a, dtype=np.float64)
+        sb = np.asarray(size_b, dtype=np.float64)
+        inter = np.where(j > 0.0, j * (sa + sb) / (1.0 + j), 0.0)
+        sa_safe = np.where(sa > 0.0, sa, 1.0)
+        sb_safe = np.where(sb > 0.0, sb, 1.0)
+        c_a = np.where(sa > 0.0, np.minimum(inter / sa_safe, 1.0), 0.0)
+        c_b = np.where(sb > 0.0, np.minimum(inter / sb_safe, 1.0), 0.0)
+        c = np.maximum(c_a, c_b)
+        valid = (sa > 0.0) & (sb > 0.0) & (c > 0.0)
+        return np.where(valid, np.power(np.where(c > 0.0, c, 1.0), 1.0 / k), 0.0)
+
     def to_bytes(self) -> bytes:
         """Serialize signature to a compact binary format."""
         header = struct.pack("<II", self.num_hashes, self.seed)
