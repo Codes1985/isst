@@ -200,6 +200,28 @@ class ClusteringConfig:
         return base + self.subtype_ani_adjustments.get(subtype, 0.0)
 
 
+# Per-segment dereplication thresholds (containment-ANI). A pair is treated as
+# the same copy on a segment when containment-ANI >= the segment's value here.
+# These allow ~5 SNVs per segment: each value is the containment-ANI at the
+# boundary between 5 and 6 well-separated SNVs (5.5 disrupted k-mer windows),
+# computed at the midpoint of each segment's expected length with that segment's
+# k. The boundary (not the exact 5-SNV point) is used so MinHash estimation
+# noise doesn't reject genuine 5-SNV outbreak pairs. STARTING VALUES — tune
+# against real within-outbreak vs within-clade distances. Independent of the
+# clustering thresholds; the only constraint is derep >= same-cluster per
+# segment (see DereplicationConfig.validate_against).
+DEFAULT_DEREP_ANI: Dict[str, float] = {
+    "PB2": 0.99747,
+    "PB1": 0.99747,
+    "PA": 0.99741,
+    "HA": 0.99661,
+    "NP": 0.99616,
+    "NA": 0.99590,
+    "M": 0.99398,
+    "NS": 0.99312,
+}
+
+
 @dataclass
 class DereplicationConfig:
     """Collapse near-identical genomes to one representative before the
@@ -217,45 +239,70 @@ class DereplicationConfig:
     reassortant — distinct on its donor segment(s) — is never collapsed into a
     lineage it only partly resembles.
 
+    Dereplication and clustering answer *different* questions and are configured
+    independently. Clustering's same-cluster ANI is a surveillance policy choice
+    (how fine a strain to track); the dereplication threshold is a measurement
+    fact (how much divergence still means "one virus, sampled twice"). They are
+    no longer derived from one another — ``segment_ani`` is the source of truth.
+    The only relationship enforced is the invariant ``derep >= same-cluster`` per
+    segment (never collapse, within a constellation, what clustering treats as
+    the edge of a cluster), checked by ``validate_against`` and warned about at
+    pipeline construction.
+
     Attributes
     ----------
     enabled : bool
-        Master switch.  When True but no per-segment thresholds are resolved
-        (``segment_ani`` is None — see ``from_clustering``), dereplication is
+        Master switch. When True but ``segment_ani`` is empty, dereplication is
         skipped and every genome is its own representative.
-    margin : float
-        Used by ``from_clustering`` to place each per-segment threshold in the
-        band between the same-cluster ANI and 1.0:
-        ``derep = same + margin * (1 - same)``.  A derep match is therefore
-        strictly tighter than "same clade".
-    segment_ani : dict, optional
-        Per-segment ANI above which two segments count as identical.  Populate
-        via ``from_clustering`` (anchored to the clustering thresholds) or set
-        explicitly.  None ⇒ dereplication inert.
+    segment_ani : dict
+        Per-segment containment-ANI at/above which two segments count as the
+        same copy. Defaults to ``DEFAULT_DEREP_ANI`` (≈5 SNVs/segment) and is the
+        source of truth — set it directly; tune against real within-outbreak vs
+        within-clade distances.
     min_kmer_ratio : float
-        Partial-segment guard.  Containment-ANI over-reads when one segment is
-        a truncated subset, so a segment is only *judged* when its two k-mer
-        sets are comparably sized (``min(|A|,|B|)/max(|A|,|B|) >= ratio``);
-        otherwise it is skipped (cannot be trusted either way).
+        Partial-segment guard. Containment-ANI over-reads when one segment is a
+        truncated subset, so a segment is only *judged* when its two k-mer sets
+        are comparably sized (``min(|A|,|B|)/max(|A|,|B|) >= ratio``); otherwise
+        it is skipped (cannot be trusted either way).
     min_shared_segments : int
         Minimum comparable-and-matching segments required to collapse a pair.
     """
     enabled: bool = True
-    margin: float = 0.5
-    segment_ani: Optional[Dict[str, float]] = None
+    segment_ani: Dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_DEREP_ANI)
+    )
     min_kmer_ratio: float = 0.85
     min_shared_segments: int = 6
+
+    def validate_against(self, clustering: "ClusteringConfig") -> List[tuple]:
+        """Return per-segment invariant violations.
+
+        Dereplication must never collapse, within a constellation, two genomes
+        that sit at the edge of what clustering considers one cluster — so each
+        derep threshold must be at least as tight as that segment's same-cluster
+        ANI. Returns ``(segment, derep_ani, same_cluster_ani)`` for every segment
+        where ``derep_ani < same_cluster_ani`` (derep looser than clustering, the
+        over-collapse direction). An empty list means the invariant holds.
+        """
+        violations: List[tuple] = []
+        for seg, derep in self.segment_ani.items():
+            same = clustering.get_ani_threshold(seg, subtype="", level="same")
+            if derep < same:
+                violations.append((seg, derep, same))
+        return violations
 
     @classmethod
     def from_clustering(
         cls, clustering: "ClusteringConfig", margin: float = 0.5, **kwargs
     ) -> "DereplicationConfig":
-        """Build a config whose per-segment thresholds are anchored above each
-        segment's same-cluster ANI: ``derep = same + margin * (1 - same)``.
+        """Bootstrap helper: seed a per-segment table from clustering thresholds.
 
-        This keeps dereplication strictly tighter than the clustering that
-        produced the constellations, and ties it to a single source of truth
-        (the clustering thresholds) rather than a free-floating constant.
+        This is *not* the normal source of truth — the populated
+        ``DEFAULT_DEREP_ANI`` table is. Use this only to regenerate a starting
+        table anchored to a specific clustering config, placing each threshold in
+        the band between same-cluster ANI and 1.0
+        (``derep = same + margin * (1 - same)``). ``margin`` is a local bootstrap
+        parameter, not a stored configuration knob.
         """
         seg_ani = {
             seg: (
@@ -265,7 +312,7 @@ class DereplicationConfig:
             )
             for seg in SEGMENTS
         }
-        return cls(margin=margin, segment_ani=seg_ani, **kwargs)
+        return cls(segment_ani=seg_ani, **kwargs)
 
 
 @dataclass

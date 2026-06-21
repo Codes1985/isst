@@ -688,8 +688,7 @@ class ReassortmentDetector:
         thresholds = cfg.segment_ani
         if not thresholds:
             logger.debug(
-                "Dereplication enabled but no per-segment thresholds resolved "
-                "(use DereplicationConfig.from_clustering); skipping"
+                "Dereplication enabled but segment_ani table is empty; skipping"
             )
             return profiles, identity
 

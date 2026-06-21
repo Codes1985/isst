@@ -29,7 +29,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from .config import GenotyperConfig, DereplicationConfig, SEGMENTS
+from .config import GenotyperConfig, SEGMENTS
 from .core import (
     DatabaseManager, SequenceProcessor, KmerExtractor, MinHashSignature,
     ClusteringEngine, ClusteringResult, ClusterAssignment, ClusterDefinition,
@@ -54,21 +54,28 @@ class GenotypingPipeline:
         # clustering that produces the constellations (single source of truth).
         # A bare DereplicationConfig leaves segment_ani unset, so we resolve it
         # here from the clustering thresholds; an explicit override is respected.
+        # Dereplication uses a standalone per-segment ANI table (its own job,
+        # not derived from clustering). Validate the one invariant — derep must
+        # be at least as tight as same-cluster, or it would over-collapse within
+        # a constellation — and warn loudly rather than silently mis-collapse.
         derep = self.config.reassortment.dereplication
-        if derep.enabled and derep.segment_ani is None:
-            self.config.reassortment.dereplication = (
-                DereplicationConfig.from_clustering(
-                    self.config.clustering,
-                    margin=derep.margin,
-                    enabled=derep.enabled,
-                    min_kmer_ratio=derep.min_kmer_ratio,
-                    min_shared_segments=derep.min_shared_segments,
+        if derep.enabled and derep.segment_ani:
+            violations = derep.validate_against(self.config.clustering)
+            if violations:
+                detail = ", ".join(
+                    f"{seg} (derep {d:.5f} < same-cluster {s:.5f})"
+                    for seg, d, s in violations
                 )
-            )
+                logger.warning(
+                    "Dereplication thresholds looser than same-cluster ANI for: "
+                    "%s. Dereplication may over-collapse genomes within a "
+                    "constellation. Tighten DereplicationConfig.segment_ani or "
+                    "loosen clustering.",
+                    detail,
+                )
             logger.info(
-                "Dereplication active (margin=%.2f, anchored to clustering "
-                "same-cluster ANI per segment)",
-                derep.margin,
+                "Dereplication active (standalone per-segment table, %d segments)",
+                len(derep.segment_ani),
             )
         self.reassortment = ReassortmentDetector(
             self.config.reassortment, db=self.db, kmer_config=self.config.kmer
