@@ -16,4 +16,6 @@ from .settings import (  # noqa: F401
     SEGMENTS,
     SUBTYPES,
     SEGMENT_LENGTH_RANGES,
+    jaccard_to_ani,
+    ani_to_jaccard,
 )

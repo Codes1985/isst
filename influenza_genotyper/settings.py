@@ -4,6 +4,7 @@ Configuration Settings
 Central configuration for the influenza k-mer genotyping system.
 """
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -16,6 +17,34 @@ SEGMENT_LENGTH_RANGES = {
     "HA": (1600, 1800), "NP": (1400, 1600), "NA": (1350, 1470),
     "M": (900, 1050), "NS": (800, 920),
 }
+
+
+def jaccard_to_ani(jaccard: float, k: int) -> float:
+    """Convert a Jaccard similarity to an ANI estimate (Mash formula).
+
+    ``ANI = 1 + (1/k) * ln(2J / (1 + J))``, clamped to ``[0, 1]``.  Used to seed
+    and reason about ANI thresholds from the legacy Jaccard thresholds.
+    """
+    if jaccard <= 0.0:
+        return 0.0
+    if jaccard >= 1.0:
+        return 1.0
+    return max(0.0, min(1.0, 1.0 + (1.0 / k) * math.log(2.0 * jaccard / (1.0 + jaccard))))
+
+
+def ani_to_jaccard(ani: float, k: int) -> float:
+    """Inverse of :func:`jaccard_to_ani`: ANI estimate -> Jaccard similarity.
+
+    From ``ANI = 1 + (1/k) ln(2J/(1+J))``: let ``x = exp(k (ANI - 1))``; then
+    ``J = x / (2 - x)``, clamped to ``[0, 1]``.  This is how an ANI cut height is
+    turned into the Jaccard cut the linkage step actually operates on.
+    """
+    if ani >= 1.0:
+        return 1.0
+    if ani <= 0.0:
+        return 0.0
+    x = math.exp(k * (ani - 1.0))
+    return max(0.0, min(1.0, x / (2.0 - x)))
 
 
 @dataclass
@@ -89,6 +118,33 @@ class ClusteringConfig:
     subtype_adjustments: Dict[str, float] = field(default_factory=lambda: {
         "H1N1pdm09": 0.0, "H3N2": -0.02,
     })
+
+    # ── ANI thresholds (forward-looking canonical knobs) ──────────────────
+    # Mechanically seeded from the Jaccard `segment_thresholds` above via
+    # jaccard_to_ani(J, k) using each segment's own k (PB2/PB1/PA/HA=21,
+    # NP/NA=19, M/NS=17).  These are the values to tweak going forward; the
+    # Jaccard table is retained only because the current clustering path still
+    # reads it, and is retired once formation/acceptance are rewired to ANI.
+    segment_ani_thresholds: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        "PB2": {"same": 0.99952, "related": 0.99597},
+        "PB1": {"same": 0.99876, "related": 0.99597},
+        "PA":  {"same": 0.99876, "related": 0.99597},
+        "HA":  {"same": 0.99797, "related": 0.99439},
+        "NP":  {"same": 0.99863, "related": 0.99555},
+        "NA":  {"same": 0.99776, "related": 0.99380},
+        "M":   {"same": 0.99879, "related": 0.99612},
+        "NS":  {"same": 0.99879, "related": 0.99612},
+    })
+    subtype_ani_adjustments: Dict[str, float] = field(default_factory=lambda: {
+        "H1N1pdm09": 0.0,
+        # The legacy -0.02 Jaccard shift maps to a per-segment ANI delta of
+        # -0.00050..-0.00064 (the mapping is nonlinear); -0.00057 is the
+        # representative mean.  Approximate by construction — split per segment
+        # later if a clade needs it.
+        "H3N2": -0.00057,
+    })
+    same_ani_threshold: float = 0.998
+    related_ani_threshold: float = 0.995
     min_cluster_size: int = 10
     max_cluster_diameter: float = 0.10
     linkage_method: str = "average"
@@ -129,6 +185,19 @@ class ClusteringConfig:
             level, self.same_cluster_threshold if level == "same" else self.related_cluster_threshold
         )
         return base + self.subtype_adjustments.get(subtype, 0.0)
+
+    def get_ani_threshold(self, segment: str, subtype: str, level: str = "same") -> float:
+        """ANI threshold for a segment/subtype/level — the ANI-space mirror of
+        :meth:`get_threshold`.
+
+        This is the forward-looking accessor; cluster formation (via
+        :func:`ani_to_jaccard`) and acceptance will read it once rewired.
+        """
+        base = self.segment_ani_thresholds.get(segment, {}).get(
+            level,
+            self.same_ani_threshold if level == "same" else self.related_ani_threshold,
+        )
+        return base + self.subtype_ani_adjustments.get(subtype, 0.0)
 
 
 @dataclass
