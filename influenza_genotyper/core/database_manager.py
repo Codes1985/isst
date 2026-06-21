@@ -15,12 +15,16 @@ from ..config import DatabaseConfig, SEGMENTS
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 # v4: signature fingerprint stored in schema_info and enforced on every run.
 #     No table changes — the fingerprint lives in the existing key/value
 #     schema_info table — so there is nothing to migrate for an existing v3 DB
 #     beyond the version stamp. The fingerprint itself is stamped lazily by the
 #     pipeline on first write via ensure_signature_fingerprint().
+# v5: orphan_events lifecycle ledger — an append-style log (one row per orphan
+#     episode) recording when a segment entered the orphan state and when/how it
+#     left. Powers the orphan reporting surface. Defined in CREATE_TABLES_SQL
+#     for fresh DBs and recreated idempotently in _migrate for upgrades.
 
 
 class SignatureFingerprintMismatch(ValueError):
@@ -197,6 +201,28 @@ CREATE INDEX IF NOT EXISTS idx_allele_segment ON allele_registry(segment_name, s
 CREATE INDEX IF NOT EXISTS idx_constellation_subtype ON constellation_registry(subtype_short);
 CREATE INDEX IF NOT EXISTS idx_allele_lineage_a ON allele_lineage(allele_a);
 CREATE INDEX IF NOT EXISTS idx_allele_lineage_b ON allele_lineage(allele_b);
+
+CREATE TABLE IF NOT EXISTS orphan_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_id      TEXT NOT NULL REFERENCES sequences(sequence_id) ON DELETE CASCADE,
+    segment_name     TEXT NOT NULL,
+    cluster_version  TEXT NOT NULL,
+    -- entry context: immutable, written when the orphan episode opens
+    category         TEXT NOT NULL CHECK (category IN ('complete','partial')),
+    completeness     REAL,
+    nearest_cluster  TEXT,
+    nearest_distance REAL,
+    entered_at       TEXT NOT NULL,
+    -- resolution: written once when the episode closes; NULL while still waiting
+    exit_reason      TEXT CHECK (exit_reason IN ('minted_new','absorbed','resolved_by_completion')),
+    exit_allele      TEXT,
+    exited_at        TEXT,
+    -- one episode per segment per cluster version; a segment may re-enter the
+    -- orphan state under a later version as a distinct row
+    UNIQUE(sequence_id, segment_name, cluster_version)
+);
+CREATE INDEX IF NOT EXISTS idx_orphan_events_open ON orphan_events(cluster_version, exited_at);
+CREATE INDEX IF NOT EXISTS idx_orphan_events_seq ON orphan_events(sequence_id);
 """
 
 
@@ -239,6 +265,179 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_allele_lineage_b ON allele_lineage(allele_b);
             """)
             logger.info("Database migrated to schema v3 (allele_lineage)")
+        if existing < 5:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS orphan_events (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sequence_id      TEXT NOT NULL REFERENCES sequences(sequence_id) ON DELETE CASCADE,
+                    segment_name     TEXT NOT NULL,
+                    cluster_version  TEXT NOT NULL,
+                    category         TEXT NOT NULL CHECK (category IN ('complete','partial')),
+                    completeness     REAL,
+                    nearest_cluster  TEXT,
+                    nearest_distance REAL,
+                    entered_at       TEXT NOT NULL,
+                    exit_reason      TEXT CHECK (exit_reason IN ('minted_new','absorbed','resolved_by_completion')),
+                    exit_allele      TEXT,
+                    exited_at        TEXT,
+                    UNIQUE(sequence_id, segment_name, cluster_version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_orphan_events_open ON orphan_events(cluster_version, exited_at);
+                CREATE INDEX IF NOT EXISTS idx_orphan_events_seq ON orphan_events(sequence_id);
+            """)
+            logger.info("Database migrated to schema v5 (orphan_events ledger)")
+
+    # ------------------------------------------------------------------
+    # Orphan lifecycle ledger
+    # ------------------------------------------------------------------
+
+    def record_orphan_entry(
+        self,
+        sequence_id: str,
+        segment_name: str,
+        cluster_version: str,
+        category: str,
+        completeness: Optional[float] = None,
+        nearest_cluster: Optional[str] = None,
+        nearest_distance: Optional[float] = None,
+    ) -> None:
+        """Open an orphan episode for a segment under a cluster version.
+
+        Idempotent per (sequence_id, segment_name, cluster_version): re-running
+        the same version does not create a duplicate episode. ``category`` is
+        'complete' or 'partial'. No-calls (segments below the length floor) are a
+        data-quality metric, not orphan episodes, and are not recorded here.
+        """
+        if category not in ("complete", "partial"):
+            raise ValueError(
+                f"orphan category must be 'complete' or 'partial', got {category!r}"
+            )
+        now = datetime.utcnow().isoformat()
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT INTO orphan_events
+                       (sequence_id, segment_name, cluster_version, category,
+                        completeness, nearest_cluster, nearest_distance, entered_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(sequence_id, segment_name, cluster_version)
+                   DO NOTHING""",
+                (sequence_id, segment_name, cluster_version, category,
+                 completeness, nearest_cluster, nearest_distance, now),
+            )
+
+    def record_orphan_exit(
+        self,
+        sequence_id: str,
+        segment_name: str,
+        cluster_version: str,
+        exit_reason: str,
+        exit_allele: Optional[str] = None,
+    ) -> bool:
+        """Close an open orphan episode, recording how it left the orphan state.
+
+        ``exit_reason`` is one of 'minted_new', 'absorbed',
+        'resolved_by_completion'. ``exit_allele`` is the allele the segment
+        became or joined, where applicable. Returns True if an open episode was
+        closed, False if there was none to close (already resolved, or never
+        recorded).
+        """
+        if exit_reason not in ("minted_new", "absorbed", "resolved_by_completion"):
+            raise ValueError(
+                "exit_reason must be one of 'minted_new', 'absorbed', "
+                f"'resolved_by_completion', got {exit_reason!r}"
+            )
+        now = datetime.utcnow().isoformat()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """UPDATE orphan_events
+                       SET exit_reason = ?, exit_allele = ?, exited_at = ?
+                     WHERE sequence_id = ? AND segment_name = ?
+                       AND cluster_version = ? AND exited_at IS NULL""",
+                (exit_reason, exit_allele, now,
+                 sequence_id, segment_name, cluster_version),
+            )
+            return cur.rowcount > 0
+
+    def count_open_orphans_by_category(
+        self, cluster_version: str
+    ) -> List[Dict[str, Any]]:
+        """Per-segment counts of currently-open orphan episodes for a version.
+
+        Returns rows of {segment_name, category, n} — the snapshot top-line.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT segment_name, category, COUNT(*) AS n
+                       FROM orphan_events
+                      WHERE cluster_version = ? AND exited_at IS NULL
+                      GROUP BY segment_name, category
+                      ORDER BY segment_name, category""",
+                (cluster_version,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_open_orphans(
+        self,
+        cluster_version: Optional[str] = None,
+        category: Optional[str] = None,
+        segment_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Open (still-waiting) orphan episodes, newest first.
+
+        Optional filters narrow by version, category, and segment. Backs the
+        persistent-waiters, cohort, and coherence panels (the latter joins these
+        rows back to their signatures in ``segment_kmers`` at report time).
+        """
+        clauses = ["exited_at IS NULL"]
+        params: List[Any] = []
+        if cluster_version is not None:
+            clauses.append("cluster_version = ?")
+            params.append(cluster_version)
+        if category is not None:
+            clauses.append("category = ?")
+            params.append(category)
+        if segment_name is not None:
+            clauses.append("segment_name = ?")
+            params.append(segment_name)
+        where = " AND ".join(clauses)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM orphan_events
+                        WHERE {where}
+                        ORDER BY entered_at DESC, id DESC""",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_orphan_resolutions(
+        self,
+        cluster_version: Optional[str] = None,
+        since: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Closed orphan episodes, for the resolution-outcome and
+        time-to-resolution panels.
+
+        Each row carries both ``entered_at`` and ``exited_at`` so wait time is
+        computed at report time rather than stored. ``since`` filters on
+        ``exited_at`` (ISO timestamp); ``cluster_version`` narrows to one version.
+        """
+        clauses = ["exited_at IS NOT NULL"]
+        params: List[Any] = []
+        if cluster_version is not None:
+            clauses.append("cluster_version = ?")
+            params.append(cluster_version)
+        if since is not None:
+            clauses.append("exited_at >= ?")
+            params.append(since)
+        where = " AND ".join(clauses)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM orphan_events
+                        WHERE {where}
+                        ORDER BY exited_at DESC, id DESC""",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Signature fingerprint — comparability guard
