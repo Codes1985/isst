@@ -26,7 +26,7 @@ from scipy.spatial.distance import squareform
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from ..config import ClusteringConfig, SEGMENTS
+from ..config import ClusteringConfig, KmerConfig, SEGMENTS, ani_to_jaccard
 from .kmer_extractor import MinHashSignature
 
 logger = logging.getLogger(__name__)
@@ -206,8 +206,13 @@ def _compute_condensed_distances(hash_matrix: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 class ClusteringEngine:
-    def __init__(self, config: Optional[ClusteringConfig] = None):
+    def __init__(
+        self,
+        config: Optional[ClusteringConfig] = None,
+        kmer_config: Optional[KmerConfig] = None,
+    ):
         self.config = config or ClusteringConfig()
+        self.kmer_config = kmer_config or KmerConfig()
         if self.config.dev_mode:
             logger.warning(
                 "ClusteringEngine: dev_mode=True — min_cluster_size lowered to %d. "
@@ -260,8 +265,17 @@ class ClusteringEngine:
         condensed = _compute_condensed_distances(hash_matrix)
 
         # --- Threshold ------------------------------------------------------
-        threshold = self.config.get_threshold(segment_name, subtype, "same")
-        distance_threshold = 1.0 - threshold
+        # The control surface is ANI: read the per-segment/subtype same-cluster
+        # ANI threshold and convert it to the Jaccard cut height the linkage
+        # tree is actually built on. For the zero-adjustment subtype this is
+        # numerically identical to the legacy Jaccard cut (to table rounding,
+        # ~1e-4); for H3N2 the representative ANI subtype adjustment shifts the
+        # effective cut by up to ~3e-3 Jaccard versus the legacy -0.02 (the
+        # known approximation to tune later). It moves the knob to ANI.
+        ani_threshold = self.config.get_ani_threshold(segment_name, subtype, "same")
+        k = self.kmer_config.get_k(segment_name)
+        jaccard_cut = ani_to_jaccard(ani_threshold, k)
+        distance_threshold = 1.0 - jaccard_cut
 
         # --- Hierarchical clustering ----------------------------------------
         try:

@@ -47,7 +47,7 @@ class GenotypingPipeline:
         self.db = DatabaseManager(self.config.database)
         self.processor = SequenceProcessor()
         self.extractor = KmerExtractor(self.config.kmer)
-        self.clusterer = ClusteringEngine(self.config.clustering)
+        self.clusterer = ClusteringEngine(self.config.clustering, self.config.kmer)
         self.assigner = GenotypeAssigner()
         self.reassortment = ReassortmentDetector(self.config.reassortment, db=self.db)
         self.nomenclature = NomenclatureManager(
