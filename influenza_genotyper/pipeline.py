@@ -381,7 +381,10 @@ class GenotypingPipeline:
         results["signatures"] = all_signatures
         timing["sequence_processing_and_kmer"] = t
 
-        # Step 3: Full clustering per segment per subtype
+        # Step 3: Per segment per subtype.  Clusters FORM from complete
+        # sequences only; partial segments may JOIN a formed cluster via
+        # containment but never found one; no-call segments (below the length
+        # floor) are excluded from clustering and assignment entirely.
         t0 = time.time()
         by_subtype: Dict[str, List] = {}
         for rec in records:
@@ -393,20 +396,53 @@ class GenotypingPipeline:
         for st, st_records in by_subtype.items():
             all_clustering[st] = {}
             for seg in SEGMENTS:
-                seq_ids, sigs = [], []
+                # Partition this segment's sequences by completeness category.
+                complete_ids, complete_sigs = [], []
+                partial_ids, partial_sigs = [], []
                 for rec in st_records:
-                    if rec.sequence_id in all_signatures and seg in all_signatures[rec.sequence_id]:
-                        seq_ids.append(rec.sequence_id)
-                        sigs.append(all_signatures[rec.sequence_id][seg])
-                if len(sigs) < 2:
-                    continue
-                cr = self.clusterer.cluster_signatures(
-                    seq_ids, sigs, seg, st, cluster_version
-                )
-                all_clustering[st][seg] = cr
-                for a in cr.assignments:
-                    all_assignments.setdefault(a.sequence_id, {})[seg] = a
+                    sig = all_signatures.get(rec.sequence_id, {}).get(seg)
+                    if sig is None:
+                        continue
+                    seg_rec = rec.segments.get(seg)
+                    category = seg_rec.category if seg_rec is not None else "complete"
+                    if category == "no_call":
+                        continue  # set aside — never clustered or assigned
+                    if category == "partial":
+                        partial_ids.append(rec.sequence_id)
+                        partial_sigs.append(sig)
+                    else:
+                        complete_ids.append(rec.sequence_id)
+                        complete_sigs.append(sig)
 
+                # Formation: complete sequences only. cluster_signatures handles
+                # the <2 case by returning orphans, so a lone complete becomes a
+                # complete orphan rather than being silently dropped.
+                formed_clusters: List[ClusterDefinition] = []
+                if complete_sigs:
+                    cr = self.clusterer.cluster_signatures(
+                        complete_ids, complete_sigs, seg, st, cluster_version
+                    )
+                    all_clustering[st][seg] = cr
+                    formed_clusters = cr.clusters
+                    for a in cr.assignments:
+                        all_assignments.setdefault(a.sequence_id, {})[seg] = a
+
+                # Partials: join a formed cluster via containment-ANI, else orphan.
+                if partial_ids:
+                    if formed_clusters:
+                        partial_assignments = self.clusterer.assign_batch_to_existing(
+                            partial_ids, partial_sigs, formed_clusters, seg, st
+                        )
+                    else:
+                        partial_assignments = [
+                            ClusterAssignment(sid, seg, None, 1.0, True)
+                            for sid in partial_ids
+                        ]
+                    for a in partial_assignments:
+                        all_assignments.setdefault(a.sequence_id, {})[seg] = a
+
+        # Persist clusters, then every assignment (complete members, joined
+        # partials, and orphans of either kind) from the merged map.
         with self.db.bulk_operation() as conn:
             for st, seg_results in all_clustering.items():
                 for seg, cr in seg_results.items():
@@ -416,19 +452,21 @@ class GenotypingPipeline:
                             cdef.centroid_signature.to_bytes() if cdef.centroid_signature else b"",
                             cdef.size, cdef.mean_diameter, cluster_version,
                         )
-                    for a in cr.assignments:
-                        if not a.is_orphan:
-                            self.db.update_cluster_assignment_conn(
-                                conn, a.sequence_id, seg,
-                                a.cluster_id, cluster_version, a.distance_to_centroid,
-                            )
-                        else:
-                            self.db.flag_orphan_conn(
-                                conn, a.sequence_id, seg,
-                                a.nearest_cluster, a.nearest_distance,
-                            )
+            for seq_id, seg_assignments in all_assignments.items():
+                for seg, a in seg_assignments.items():
+                    if not a.is_orphan:
+                        self.db.update_cluster_assignment_conn(
+                            conn, a.sequence_id, seg,
+                            a.cluster_id, cluster_version, a.distance_to_centroid,
+                        )
+                    else:
+                        self.db.flag_orphan_conn(
+                            conn, a.sequence_id, seg,
+                            a.nearest_cluster, a.nearest_distance,
+                        )
 
         results["clustering"] = all_clustering
+        results["assignments"] = all_assignments
         timing["clustering"] = time.time() - t0
 
         # Step 4: Nomenclature + genotypes
@@ -549,9 +587,14 @@ class GenotypingPipeline:
                 seg_clusters = st_ref.get(seg, [])
                 seq_ids, sigs = [], []
                 for rec in st_records:
-                    if rec.sequence_id in all_signatures and seg in all_signatures[rec.sequence_id]:
-                        seq_ids.append(rec.sequence_id)
-                        sigs.append(all_signatures[rec.sequence_id][seg])
+                    sig = all_signatures.get(rec.sequence_id, {}).get(seg)
+                    if sig is None:
+                        continue
+                    seg_rec = rec.segments.get(seg)
+                    if seg_rec is not None and seg_rec.category == "no_call":
+                        continue  # set aside — too short to assign reliably
+                    seq_ids.append(rec.sequence_id)
+                    sigs.append(sig)
                 if not seq_ids:
                     continue
 
@@ -733,9 +776,18 @@ class GenotypingPipeline:
         total_clusters = sum(
             cr.num_clusters for st in clustering.values() for cr in st.values()
         )
-        total_orphans = sum(
-            cr.num_orphans for st in clustering.values() for cr in st.values()
-        )
+        # Orphans are counted from the merged assignment map so that partial
+        # segments that failed to join a cluster (routed through acceptance, not
+        # cluster_signatures) are included alongside complete orphans.
+        assignments = results.get("assignments", {})
+        if assignments:
+            total_orphans = sum(
+                1 for segs in assignments.values() for a in segs.values() if a.is_orphan
+            )
+        else:
+            total_orphans = sum(
+                cr.num_orphans for st in clustering.values() for cr in st.values()
+            )
 
         if mode == "incremental":
             orphan_counts = results.get("orphan_counts", {})
