@@ -133,6 +133,32 @@ class GenotypingPipeline:
 
         return records, all_signatures, time.time() - t0
 
+    def _record_orphan_entry(
+        self, conn, rec, segment_name: str, assignment, cluster_version: str
+    ) -> None:
+        """Open an orphan-ledger episode for a just-flagged orphan segment.
+
+        Category and completeness come from the segment record; nearest cluster
+        and distance from the assignment. Only complete/partial segments are
+        recorded — no-calls never reach assignment, so they are never orphans.
+        Idempotent per (sequence_id, segment, cluster_version).
+        """
+        if rec is None:
+            return
+        seg_rec = rec.segments.get(segment_name)
+        if seg_rec is None or seg_rec.category not in ("complete", "partial"):
+            return
+        self.db.record_orphan_entry_conn(
+            conn,
+            sequence_id=assignment.sequence_id,
+            segment_name=segment_name,
+            cluster_version=cluster_version,
+            category=seg_rec.category,
+            completeness=seg_rec.completeness,
+            nearest_cluster=assignment.nearest_cluster,
+            nearest_distance=assignment.nearest_distance,
+        )
+
     def _assign_nomenclature_and_genotypes(
         self,
         records,
@@ -443,6 +469,7 @@ class GenotypingPipeline:
 
         # Persist clusters, then every assignment (complete members, joined
         # partials, and orphans of either kind) from the merged map.
+        rec_by_id = {r.sequence_id: r for r in records}
         with self.db.bulk_operation() as conn:
             for st, seg_results in all_clustering.items():
                 for seg, cr in seg_results.items():
@@ -463,6 +490,9 @@ class GenotypingPipeline:
                         self.db.flag_orphan_conn(
                             conn, a.sequence_id, seg,
                             a.nearest_cluster, a.nearest_distance,
+                        )
+                        self._record_orphan_entry(
+                            conn, rec_by_id.get(seq_id), seg, a, cluster_version
                         )
 
         results["clustering"] = all_clustering
@@ -633,6 +663,9 @@ class GenotypingPipeline:
                             self.db.flag_orphan_conn(
                                 conn, a.sequence_id, seg,
                                 a.nearest_cluster, a.nearest_distance,
+                            )
+                            self._record_orphan_entry(
+                                conn, rec, seg, a, resolved_version
                             )
 
         # Update member counts on cluster rows (outside the bulk transaction

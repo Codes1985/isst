@@ -312,18 +312,41 @@ class DatabaseManager:
             raise ValueError(
                 f"orphan category must be 'complete' or 'partial', got {category!r}"
             )
-        now = datetime.utcnow().isoformat()
         with self.connection() as conn:
-            conn.execute(
-                """INSERT INTO orphan_events
-                       (sequence_id, segment_name, cluster_version, category,
-                        completeness, nearest_cluster, nearest_distance, entered_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(sequence_id, segment_name, cluster_version)
-                   DO NOTHING""",
-                (sequence_id, segment_name, cluster_version, category,
-                 completeness, nearest_cluster, nearest_distance, now),
+            self.record_orphan_entry_conn(
+                conn, sequence_id, segment_name, cluster_version, category,
+                completeness, nearest_cluster, nearest_distance,
             )
+
+    def record_orphan_entry_conn(
+        self,
+        conn: Any,
+        sequence_id: str,
+        segment_name: str,
+        cluster_version: str,
+        category: str,
+        completeness: Optional[float] = None,
+        nearest_cluster: Optional[str] = None,
+        nearest_distance: Optional[float] = None,
+    ) -> None:
+        """Connection-bound form of :meth:`record_orphan_entry`, for use inside
+        an existing ``bulk_operation`` write transaction (opening a second
+        connection there would deadlock on the SQLite write lock)."""
+        if category not in ("complete", "partial"):
+            raise ValueError(
+                f"orphan category must be 'complete' or 'partial', got {category!r}"
+            )
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            """INSERT INTO orphan_events
+                   (sequence_id, segment_name, cluster_version, category,
+                    completeness, nearest_cluster, nearest_distance, entered_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(sequence_id, segment_name, cluster_version)
+               DO NOTHING""",
+            (sequence_id, segment_name, cluster_version, category,
+             completeness, nearest_cluster, nearest_distance, now),
+        )
 
     def record_orphan_exit(
         self,
