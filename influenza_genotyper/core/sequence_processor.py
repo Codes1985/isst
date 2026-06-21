@@ -26,6 +26,47 @@ SEGMENT_PATTERNS = {
 }
 SEGMENT_NUMBER_MAP = {"1":"PB2","2":"PB1","3":"PA","4":"HA","5":"NP","6":"NA","7":"M","8":"NS"}
 
+# ---------------------------------------------------------------------------
+# Length-based completeness gating
+# ---------------------------------------------------------------------------
+#
+# A segment is classified by length relative to its expected range:
+#   * 'complete' — at or above the minimum expected length (a full reference).
+#   * 'partial'  — between the no-call floor and the minimum expected length;
+#                  usable to *join* an existing cluster but never to found one.
+#   * 'no_call'  — below the floor; too short for a trustworthy MinHash /
+#                  containment estimate, so it is set aside rather than assigned.
+#
+# This is a single knob: the floor is expressed as a fraction of the minimum
+# expected length. It coincides with the existing "Very short" note boundary.
+# Category is a pure length judgement, independent of `is_valid` (which gates
+# base/ambiguity quality); the pipeline intersects the two when routing.
+NO_CALL_LENGTH_FRACTION = 0.5
+
+
+def classify_completeness(
+    length: int,
+    segment_name: str,
+    no_call_floor: float = NO_CALL_LENGTH_FRACTION,
+) -> Tuple[Optional[float], str]:
+    """Return ``(completeness, category)`` for a segment of the given length.
+
+    ``completeness`` is ``min(1.0, length / min_expected_length)`` — 1.0 for a
+    segment at or above its minimum expected length — or ``None`` when the
+    segment has no known expected range (cannot be judged; treated as complete).
+    ``category`` is 'complete', 'partial', or 'no_call'.
+    """
+    rng = SEGMENT_LENGTH_RANGES.get(segment_name)
+    if rng is None or rng[0] <= 0:
+        return None, "complete"  # no reference range -> cannot judge; assume full
+    min_len = rng[0]
+    completeness = min(1.0, length / min_len)
+    if completeness < no_call_floor:
+        return completeness, "no_call"
+    if completeness < 1.0:
+        return completeness, "partial"
+    return completeness, "complete"
+
 
 @dataclass
 class SegmentRecord:
@@ -34,6 +75,8 @@ class SegmentRecord:
     length: int
     is_valid: bool = True
     validation_notes: List[str] = field(default_factory=list)
+    completeness: Optional[float] = None   # min(1.0, length / min_expected_length)
+    category: str = "complete"             # 'complete' | 'partial' | 'no_call'
 
 
 @dataclass
@@ -60,6 +103,22 @@ class SequenceRecord:
     def valid_segments(self) -> Dict[str, SegmentRecord]:
         return {k: v for k, v in self.segments.items() if v.is_valid}
 
+    def segments_in_category(self, category: str) -> Dict[str, SegmentRecord]:
+        """Segments whose length category matches (independent of is_valid)."""
+        return {k: v for k, v in self.segments.items() if v.category == category}
+
+    @property
+    def complete_segments(self) -> Dict[str, SegmentRecord]:
+        return self.segments_in_category("complete")
+
+    @property
+    def partial_segments(self) -> Dict[str, SegmentRecord]:
+        return self.segments_in_category("partial")
+
+    @property
+    def no_call_segments(self) -> Dict[str, SegmentRecord]:
+        return self.segments_in_category("no_call")
+
 
 def clean_sequence(seq: str) -> str:
     return re.sub(r"\s+", "", seq).upper().replace("U", "T")
@@ -77,7 +136,7 @@ def validate_sequence(sequence: str, segment_name: str) -> Tuple[bool, List[str]
     length = len(sequence)
     if segment_name in SEGMENT_LENGTH_RANGES:
         min_len, max_len = SEGMENT_LENGTH_RANGES[segment_name]
-        if length < min_len * 0.5:
+        if length < min_len * NO_CALL_LENGTH_FRACTION:
             notes.append(f"Very short ({length} bp, expected {min_len}-{max_len})")
         elif length < min_len:
             notes.append(f"Below range ({length} bp, expected {min_len}-{max_len})")
@@ -167,8 +226,13 @@ def parse_fasta_string(fasta_text: str) -> List[Tuple[str, str]]:
 
 
 class SequenceProcessor:
-    def __init__(self, default_subtype: Optional[str] = None):
+    def __init__(
+        self,
+        default_subtype: Optional[str] = None,
+        no_call_length_fraction: float = NO_CALL_LENGTH_FRACTION,
+    ):
         self.default_subtype = default_subtype
+        self.no_call_length_fraction = no_call_length_fraction
 
     def process_file(self, filepath: str) -> List[SequenceRecord]:
         path = Path(filepath)
@@ -213,9 +277,13 @@ class SequenceProcessor:
                 logger.warning(f"Duplicate segment {segment} for {isolate_id}, keeping first")
                 continue
 
+            completeness, category = classify_completeness(
+                len(sequence), segment, self.no_call_length_fraction
+            )
             record.segments[segment] = SegmentRecord(
                 segment_name=segment, sequence=sequence,
                 length=len(sequence), is_valid=is_valid, validation_notes=notes,
+                completeness=completeness, category=category,
             )
 
         results = list(isolates.values())
@@ -242,9 +310,12 @@ class SequenceProcessor:
             "partial_genomes": sum(1 for r in records if not r.is_complete),
             "by_subtype": {},
             "segment_coverage": {seg: 0 for seg in SEGMENTS},
+            "segment_categories": {"complete": 0, "partial": 0, "no_call": 0},
         }
         for record in records:
             summary["by_subtype"][record.subtype] = summary["by_subtype"].get(record.subtype, 0) + 1
-            for seg_name in record.segments:
+            for seg_name, seg_rec in record.segments.items():
                 summary["segment_coverage"][seg_name] += 1
+                if seg_rec.category in summary["segment_categories"]:
+                    summary["segment_categories"][seg_rec.category] += 1
         return summary
