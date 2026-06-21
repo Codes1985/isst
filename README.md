@@ -132,7 +132,7 @@ and how past orphans were ultimately resolved. The `OrphanReporter` class (and t
 `GenotypingPipeline.orphan_report(...)` convenience method) assembles this into a
 set of read-only panels — current snapshot, candidate novel lineages, near-misses,
 partial sequences waiting by segment, and resolution outcomes over time — with a
-plain-text renderer for CLI use.
+plain-text renderer surfaced by the `orphan-report` subcommand (see [Inspecting orphans](#inspecting-orphans)).
 
 ## Installation
 
@@ -174,8 +174,8 @@ needed there.
 
 ## Quickstart
 
-The pipeline has two subcommands: `run` (batch / incremental / recluster) and
-`repair`.
+The pipeline has three subcommands: `run` (batch / incremental / recluster),
+`repair`, and `orphan-report`.
 
 ```bash
 # 1. Initial reference run on a baseline dataset
@@ -186,6 +186,9 @@ run-genotyper run sequences_week42.fasta --mode incremental
 
 # 3. Periodic re-clustering when the orphan rate climbs
 run-genotyper run sequences_all.fasta --mode recluster
+
+# 4. Inspect the orphan ledger at any time (read-only; makes no changes)
+run-genotyper orphan-report --cluster-version v1
 ```
 
 Segment identity is inferred from FASTA headers. Outputs are written to
@@ -216,6 +219,42 @@ run-genotyper repair \
 
 # then commit by dropping --dry-run
 ```
+
+### Inspecting orphans
+
+The `orphan-report` subcommand prints a read-only summary of the orphan ledger —
+how many sequences are waiting, which are closest to joining a cluster
+(threshold-review candidates), candidate novel lineages (one isolate orphaning on
+several segments at once), partial segments awaiting a full-length example, and
+how past orphans were resolved with their wait times. It changes nothing and does
+not trigger a re-clustering; it is a monitoring view you read to decide whether a
+recluster or a threshold review is warranted.
+
+```bash
+# Snapshot windowed to a cluster version (history panels always span versions)
+run-genotyper orphan-report --cluster-version v1
+
+# Full report as JSON, for piping into other tools
+run-genotyper orphan-report --json
+```
+
+A typical run looks like:
+
+```
+Orphan report (v3)
+  Open: 7 (5 complete, 2 partial)
+  Multi-segment complete orphans (candidate novel lineages): 1
+    A/Manitoba/12/2026: HA, NA, PB1
+  Nearest near-misses:
+    A/Saskatchewan/7/2026/HA → HA.3.0007 (dist 0.0120)
+    A/Alberta/3/2026/NA → NA.2.0011 (dist 0.0180)
+  Resolved to date: 5 (minted_new 2, absorbed 2, by_completion 1)
+  Time-to-resolution (days): median 29.0, max 35.0 (n=5)
+  Oldest waiter: A/Nunavut/2/2026/PB1 (63.0 days)
+```
+
+It is most useful after incremental ingestion (to see what is accumulating) and
+after a recluster (to see what resolved and how long it took).
 
 ## Reproducibility note
 

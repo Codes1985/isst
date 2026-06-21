@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_run_parser(sub)
     _add_repair_parser(sub)
+    _add_orphan_report_parser(sub)
 
     return p
 
@@ -200,6 +201,55 @@ def _add_repair_parser(sub):
             "Report which sequences would be affected without making any changes. "
             "Recommended before committing a repair."
         ))
+
+    p.add_argument("--log-level", metavar="LEVEL", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity. (default: INFO)")
+
+    return p
+
+
+def _add_orphan_report_parser(sub):
+    p = sub.add_parser(
+        "orphan-report",
+        help="Summarise the orphan lifecycle ledger (read-only).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Print a read-only summary of the orphan lifecycle ledger.\n\n"
+            "An orphan is a sequence that cleared the completeness gate but matched\n"
+            "no existing cluster closely enough to be placed. This command reports:\n"
+            "  - how many orphans are open now (complete vs partial),\n"
+            "  - candidate novel lineages (one isolate orphaning on several segments\n"
+            "    at once),\n"
+            "  - near-misses (orphans closest to joining a cluster — threshold-review\n"
+            "    candidates),\n"
+            "  - partial segments awaiting a full-length example,\n"
+            "  - and how past orphans were ultimately resolved, with wait times.\n\n"
+            "It makes no changes and does not trigger a re-clustering; it is a\n"
+            "monitoring view a human reads to decide whether a recluster or a\n"
+            "threshold review is warranted. Run it after incremental ingestion to\n"
+            "see what is accumulating, and after a recluster to see what resolved.\n\n"
+            "Example\n"
+            "-------\n"
+            "  run-genotyper orphan-report --cluster-version v1\n"
+        ),
+    )
+
+    p.add_argument("--db", metavar="PATH", default="data/influenza_genotyper.db",
+        help="Path to the SQLite database. (default: data/influenza_genotyper.db)")
+
+    p.add_argument("--cluster-version", metavar="VERSION", default=None,
+        help=(
+            "Window the snapshot panels to this cluster version. History panels "
+            "(resolutions, wait times) always span all versions. "
+            "(default: all open episodes)"
+        ))
+
+    p.add_argument("--limit", metavar="N", type=int, default=20,
+        help="Maximum rows in the near-miss and persistent-waiter lists. (default: 20)")
+
+    p.add_argument("--json", action="store_true", default=False,
+        help="Emit the full report as JSON instead of the text summary.")
 
     p.add_argument("--log-level", metavar="LEVEL", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -538,6 +588,37 @@ def cmd_repair(args, log) -> int:
     return 0
 
 
+def cmd_orphan_report(args, log) -> int:
+    db_path = Path(args.db)
+    if not db_path.exists():
+        log.error(f"Database not found: {db_path}")
+        return 1
+
+    try:
+        from influenza_genotyper import GenotypingPipeline, GenotyperConfig
+        from influenza_genotyper.settings import DatabaseConfig
+        from influenza_genotyper.core.orphan_report import OrphanReporter
+    except ImportError as exc:
+        log.error(f"Could not import influenza_genotyper: {exc}\n"
+                  "Ensure the package is installed or PYTHONPATH is set correctly.")
+        return 1
+
+    config = GenotyperConfig(
+        database=DatabaseConfig(sqlite_path=db_path),
+    )
+    pipeline = GenotypingPipeline(config=config)
+    pipeline.initialize()
+
+    report = pipeline.orphan_report(cluster_version=args.cluster_version, limit=args.limit)
+
+    if args.json:
+        import json
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(OrphanReporter.render_text(report))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -557,6 +638,8 @@ def main() -> int:
         return cmd_run(args, log)
     elif args.subcommand == "repair":
         return cmd_repair(args, log)
+    elif args.subcommand == "orphan-report":
+        return cmd_orphan_report(args, log)
     else:
         parser.print_help()
         return 1

@@ -126,10 +126,9 @@ class ClusteringConfig:
         # approximate by construction — split per segment later if a clade needs it.
         "H3N2": -0.00057,
     })
-    same_ani_threshold: float = 0.998
-    related_ani_threshold: float = 0.995
+    same_ani_threshold: float = 0.989
+    related_ani_threshold: float = 0.98
     min_cluster_size: int = 10
-    max_cluster_diameter: float = 0.10
     linkage_method: str = "average"
     min_segments_for_constellation: int = 6
     """Minimum number of segments that must have an assigned allele for a
