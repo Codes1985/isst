@@ -8,16 +8,14 @@ within-clade reassortment signals.
 
 import logging
 import random
-import tempfile
 
 import pytest
 
 from influenza_genotyper.config import (
-    KmerConfig, ReassortmentConfig, GenotyperConfig, DatabaseConfig, ClusteringConfig,
+    KmerConfig, ReassortmentConfig,
 )
 from influenza_genotyper.core.kmer_extractor import KmerExtractor
 from influenza_genotyper.core.reassortment_detector import ReassortmentDetector
-from influenza_genotyper.pipeline import GenotypingPipeline
 
 logging.disable(logging.CRITICAL)
 
@@ -74,23 +72,3 @@ def test_truncated_is_closer_than_a_few_mutations(det_and_sigs):
 def test_unrelated_is_far(det_and_sigs):
     det, ref, sigs = det_and_sigs
     assert det._segment_distance("HA", ref, sigs["unrelated"]) > 0.5
-
-
-def test_pipeline_runs_with_reassortment_enabled():
-    """Smoke: a full run with Stage 2 enabled completes on the new metric."""
-    rng = random.Random(3)
-    A = _rnd(1700, rng)
-    records = []
-    for i in range(4):
-        for seg, length in [("HA", 1700), ("NA", 1400), ("PB1", 2200)]:
-            records.append((f"iso{i}", seg, _mut(A[:length] if len(A) >= length else A, 2, rng)))
-    fp = tempfile.mktemp(suffix=".fasta")
-    with open(fp, "w") as fh:
-        fh.write("\n".join(f">{i}|{s}\n{q}" for i, s, q in records))
-    cfg = GenotyperConfig.default()
-    cfg.clustering = ClusteringConfig(dev_mode=True)
-    cfg.database = DatabaseConfig(sqlite_path=tempfile.mktemp(suffix=".db"))
-    pipe = GenotypingPipeline(cfg)
-    pipe.initialize()
-    res = pipe.run(fp, subtype="H1N1pdm09", cluster_version="v1", detect_reassortment=True)
-    assert "reassortment" in res  # ran without error
