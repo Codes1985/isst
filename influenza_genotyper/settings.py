@@ -97,6 +97,7 @@ class KmerConfig:
             "hash_seed": self.hash_seed,
             "canonical": self.canonical,
             "hash_backend": self.hash_backend,
+            "kmer_alphabet": "ACGT",
             "segment_k": {seg: self.get_k(seg) for seg in SEGMENTS},
         }
 

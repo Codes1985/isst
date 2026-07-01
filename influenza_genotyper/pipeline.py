@@ -258,8 +258,17 @@ class GenotypingPipeline:
             all_centroid_signatures=centroid_sig_map if centroid_sig_map else None,
         )
 
+        # Segments eligible to appear in the genotype profile: those that pass
+        # the base-quality gate (valid_segments) AND are not length-category
+        # 'no_call'. no_call segments are excluded from clustering and naming, so
+        # surfacing them as ORPHAN here would contradict that routing and perturb
+        # the constellation key ('?' vs None); treat them as missing instead.
         available_map = {
-            rec.sequence_id: list(rec.valid_segments.keys()) for rec in records
+            rec.sequence_id: [
+                seg for seg, seg_rec in rec.valid_segments.items()
+                if seg_rec.category != "no_call"
+            ]
+            for rec in records
         }
         genotypes = self.assigner.assign_batch(
             all_assignments, available_map
