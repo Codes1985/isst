@@ -79,14 +79,24 @@ def canonical_kmer(kmer: str) -> str:
     return kmer if kmer <= rc else rc
 
 
+# K-mers are built over the concrete DNA alphabet only. Any window carrying a
+# base outside this set — 'N' or any other IUPAC ambiguity code (R/Y/S/W/K/M/
+# B/D/H/V) — is dropped, because such a window hashes as a literal string that
+# matches nothing in the resolved sequence and would silently deflate
+# containment/Jaccard against an otherwise-identical genome. (Upstream cleaning
+# uppercases and maps U->T, so ACGT is the full expected alphabet here.)
+_KMER_ALPHABET = frozenset("ACGT")
+
+
 def extract_kmers(sequence: str, k: int, canonical: bool = True) -> List[str]:
-    """Extract all k-mers from a sequence, skipping those containing N."""
+    """Extract all k-mers from a sequence, skipping any that contain a base
+    outside the concrete ACGT alphabet (N or any IUPAC ambiguity code)."""
     if len(sequence) < k:
         return []
     kmers = []
     for i in range(len(sequence) - k + 1):
         kmer = sequence[i:i+k]
-        if "N" in kmer:
+        if not _KMER_ALPHABET.issuperset(kmer):
             continue
         if canonical:
             kmer = canonical_kmer(kmer)
