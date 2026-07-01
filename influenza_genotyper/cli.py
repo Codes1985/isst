@@ -143,6 +143,12 @@ def _add_run_parser(sub):
     p.add_argument("--permutations", metavar="N", type=int, default=1000,
         help="Permutations per segment per event for validation. (default: 1000)")
 
+    p.add_argument("--allow-param-change", action="store_true", default=False,
+        help="Re-stamp the database signature fingerprint instead of aborting "
+             "when k-mer/hash parameters differ from the stored ones (e.g. a new "
+             "--num-hashes). Abandons comparability with existing signatures; use "
+             "deliberately, and re-extract the database afterwards.")
+
     p.add_argument("--log-level", metavar="LEVEL", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity. (default: INFO)")
@@ -455,7 +461,7 @@ def cmd_run(args, log) -> int:
     )
 
     pipeline = GenotypingPipeline(config=config)
-    pipeline.initialize()
+    pipeline.initialize(allow_param_change=args.allow_param_change)
 
     log.info(f"Mode: {args.mode} | Input: {fasta_path}")
 
