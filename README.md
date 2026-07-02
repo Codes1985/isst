@@ -21,7 +21,10 @@ one through these steps:
    This category drives how the segment is routed downstream.
 2. **Extract k-mers** — each segment is broken into overlapping k-mers, with
    `k` chosen per segment (21 for the long segments, down to 17 for the
-   shortest). K-mers containing an ambiguous base (`N`) are dropped, and each is
+   shortest). Any k-mer containing a base outside the concrete `ACGT` alphabet —
+   `N` or any other IUPAC ambiguity code (`R Y S W K M B D H V`) — is dropped, so
+   an ambiguous base removes only the k-mer windows that span it, never the whole
+   sequence. Each surviving k-mer is
    canonicalized — folded to the smaller of itself and its reverse complement —
    so the result is strand-independent. The unique set of canonical k-mers is
    what carries forward.
@@ -259,11 +262,12 @@ after a recluster (to see what resolved and how long it took).
 ## Reproducibility note
 
 MinHash signatures are only comparable when built with identical parameters:
-`num_hashes`, `hash_seed`, per-segment `k`, the `canonical` flag, and the hash
-backend. The first run against a database **stamps these into a signature
-fingerprint**; every later run validates against it and refuses to proceed on
-any mismatch, with a message naming the offending parameter. This turns a
-silent incompatibility into a clear error before any data is written.
+`num_hashes`, `hash_seed`, per-segment `k`, the `canonical` flag, the k-mer
+alphabet (which bases are admitted into a k-mer), and the hash backend. The first
+run against a database **stamps these into a signature fingerprint**; every later
+run validates against it and refuses to proceed on any mismatch, with a message
+naming the offending parameter. This turns a silent incompatibility into a clear
+error before any data is written.
 
 The hash backend is pinned to `mmh3` (MurmurHash3, x64 128-bit variant) with no
 fallback, and a startup self-test checks it against a known vector, so a backend
@@ -271,7 +275,9 @@ or library-version change can't quietly alter signatures either.
 
 To deliberately change a parameter you must re-stamp the database (an explicit
 override that abandons comparability with existing signatures) — which on a
-populated database means re-extracting it. For publication-grade reproducibility,
+populated database means re-extracting it. Re-stamping is opt-in: pass
+`run-genotyper run ... --allow-param-change` to re-stamp instead of aborting on a
+fingerprint mismatch. For publication-grade reproducibility,
 also pin exact dependency versions (e.g. a `requirements.txt` lockfile or
 `pip freeze`) rather than relying on the lower bounds in `pyproject.toml`.
 
@@ -296,10 +302,31 @@ influenza_genotyper/
 
 The `run-genotyper` console command maps to `influenza_genotyper.cli:main`.
 Dependency direction runs strictly downward: the CLI depends on the pipeline,
-the pipeline on the core engines, and the engines on config. ANI thresholds and
-the containment metric are defined in `settings.py`/`kmer_extractor.py` and
-shared by clustering, naming, and reassortment detection, so the three never
-diverge on how similarity is measured.
+the pipeline on the core engines, and the engines on config. ANI *thresholds*
+are defined once in `settings.py` and read by clustering, naming, and
+reassortment detection alike, so all three cut at the same ANI values.
+
+Two ANI *estimators* sit underneath those shared thresholds, chosen per stage:
+
+- **Cluster formation** (batch/recluster) builds its hierarchical tree on a
+  Jaccard-based ANI (the Mash relationship), which is a proper symmetric metric —
+  the right input for linkage.
+- **Incremental acceptance, allele naming, dereplication, and the Stage-2
+  distance** use **containment-ANI**, which is length-tolerant so a
+  truncated-but-identical segment scores near-identical instead of being
+  penalised for missing length.
+
+The two estimates coincide for complete, equal-length segments — which is all
+formation ever sees, since only complete segments form clusters — and diverge
+only when k-mer set sizes differ, i.e. for partials, which are routed exclusively
+through the containment path (they *join* an existing cluster, never *form* one).
+In practice, then, the estimator split follows the "right tool for the job" rule
+rather than being an inconsistency. It does mean that length differences *within*
+the complete bucket (e.g. some segments trimmed to the coding region, others
+retaining UTRs) can make formation read same-lineage sequences as slightly more
+distant than acceptance/naming would. Feeding `isst` length-consistent input —
+e.g. all segments trimmed to a common span before ingestion — keeps the two
+estimators in lock-step and is the recommended way to avoid this entirely.
 
 ## Development
 
